@@ -221,7 +221,7 @@ const SKINS = ['#f1c7a5', '#d9a27c', '#b47a54', '#8a5a3b', '#5c3a24', '#7cc576',
 const SKIN_NAMES = ['Light', 'Fair', 'Tan', 'Brown', 'Dark', 'Zombie', 'Alien'];
 
 const state = {
-  tool: 0, item: 0, time: 0, gravity: 3, paused: false, ai: true, map: 0, snap: true,
+  tool: 0, item: 0, time: 0, gravity: 3, paused: false, ai: true, map: 0, snap: true, gore: 2,
   npc: { shirt: 1, pants: 0, skin: 0, height: 1.8, behavior: 1, health: 1, random: false },
 };
 
@@ -525,6 +525,261 @@ const ITEMS = [
 ];
 
 // ====================================================================
+//  Gore: wound shader, skeleton & organs, gibs, blood
+// ====================================================================
+const GORE_H = 10, GORE_B = 12;
+const GORE_MODES = ['Off', 'Bruises only', 'Full'];
+// Skin material that can have chunks cut out (discarded spheres in part-local space),
+// shows bruises, and renders its inside faces as raw meat.
+function goreMaterial(color, o = {}) {
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: o.rough ?? 0.75, side: THREE.DoubleSide });
+  const u = o.shared ? { ...o.shared } : {
+    uHoles: { value: Array.from({ length: GORE_H }, () => new THREE.Vector4(0, 0, 0, 0)) },
+    uBruise: { value: Array.from({ length: GORE_B }, () => new THREE.Vector4(0, 0, 0, 0)) },
+    uBruiseK: { value: new Array(GORE_B).fill(0) },
+    uChar: { value: 0 },
+  };
+  u.uCloth = { value: o.cloth ? 1 : 0 };
+  u.uMeat = { value: new THREE.Color(o.meat ?? 0x7a1410) };
+  u.uHoleScale = { value: o.holeScale ?? 1 };
+  u.uBruiseOn = { value: o.noBruise ? 0 : 1 };
+  mat.userData.gore = u;
+  mat.customProgramCacheKey = () => 'gore1';
+  mat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, u);
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vGoreP;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvGoreP = position;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>
+varying vec3 vGoreP;
+uniform vec4 uHoles[${GORE_H}]; uniform vec4 uBruise[${GORE_B}]; uniform float uBruiseK[${GORE_B}];
+uniform float uCloth, uHoleScale, uBruiseOn, uChar; uniform vec3 uMeat;
+float goreN(vec3 p) { return fract(sin(dot(floor(p), vec3(12.9898, 78.233, 37.719))) * 43758.5453); }`)
+      .replace('#include <map_fragment>', `#include <map_fragment>
+{
+  float rim = 0.0;
+  for (int i = 0; i < ${GORE_H}; i++) {
+    vec4 h = uHoles[i];
+    if (h.w <= 0.0) continue;
+    float r = h.w * uHoleScale * (0.8 + 0.35 * goreN(vGoreP * 160.0 + float(i)));
+    float d = distance(vGoreP, h.xyz);
+    if (d < r) discard;
+    rim = max(rim, 1.0 - smoothstep(r, r * 1.7 + 0.006, d));
+  }
+  float bz = 0.0;
+  if (uBruiseOn > 0.5) for (int i = 0; i < ${GORE_B}; i++) {
+    vec4 b = uBruise[i];
+    if (b.w <= 0.0) continue;
+    float d = distance(vGoreP, b.xyz);
+    float k = uBruiseK[i] * (1.0 - smoothstep(b.w * 0.25, b.w, d * (0.85 + 0.3 * goreN(vGoreP * 90.0))));
+    bz = max(bz, k);
+  }
+  vec3 bc = uCloth > 0.5 ? mix(vec3(0.42, 0.06, 0.04), vec3(0.22, 0.02, 0.02), bz)
+                         : mix(vec3(0.62, 0.55, 0.28), mix(vec3(0.42, 0.12, 0.32), vec3(0.2, 0.08, 0.24), bz), smoothstep(0.15, 0.55, bz));
+  diffuseColor.rgb = mix(diffuseColor.rgb, bc, clamp(bz * 1.15, 0.0, 0.9));
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.38, 0.02, 0.02), rim * 0.92);
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.07, 0.04, 0.03), uChar);
+  if (!gl_FrontFacing) diffuseColor.rgb = uMeat;
+}`);
+  };
+  return mat;
+}
+const GORE_COL = { bone: 0xe9e0c8, lung: 0xe07a8a, heart: 0x8f0f18, liver: 0x6a1d14, stomach: 0xd98a7a, gut: 0xd47a80, brain: 0xe8a2a8, kidney: 0x7a2418, muscle: 0x9a2a22 };
+const goreMats = {};
+function goreMat(k) { return goreMats[k] || (goreMats[k] = new THREE.MeshStandardMaterial({ color: GORE_COL[k], roughness: k === 'bone' ? 0.6 : 0.35, metalness: 0 })); }
+// Builds bones and organs inside a body part. Hidden until the part is opened up.
+function buildInnards(key, mesh, s, P) {
+  const g = new THREE.Group(); g.visible = false;
+  const add = (geo, k, x, y, z, sc, rot) => {
+    const m = new THREE.Mesh(geo, typeof k === 'string' ? goreMat(k) : k);
+    m.position.set(x * s, y * s, z * s); if (sc) m.scale.set(...sc); if (rot) m.rotation.set(...rot);
+    m.userData.innard = true; g.add(m); return m;
+  };
+  const sph = (r, w = 14, h = 10) => new THREE.SphereGeometry(r * s, w, h);
+  const cyl = (r, l, n = 8) => new THREE.CylinderGeometry(r * s, r * s, l * s, n);
+  if (key === 'torso') {
+    add(cyl(0.02, 0.56), 'bone', 0, 0, -0.068);                                  // spine
+    for (let i = 0; i < 6; i++) {                                                // vertebrae knobs
+      add(new THREE.BoxGeometry(0.03 * s, 0.025 * s, 0.03 * s), 'bone', 0, -0.2 + i * 0.09, -0.085);
+    }
+    for (let i = 0; i < 6; i++) {                                                // ribs
+      const y = 0.215 - i * 0.042, w = 0.15 - Math.abs(i - 1.5) * 0.008;
+      add(new THREE.TorusGeometry(w * s, 0.008 * s, 5, 22, Math.PI * 1.75).rotateZ(-Math.PI * 0.375), 'bone', 0, y, -0.005, [1, 0.56, 1], [Math.PI / 2, 0, 0]);
+    }
+    add(new THREE.BoxGeometry(0.03 * s, 0.2 * s, 0.012 * s), 'bone', 0, 0.12, 0.078);        // sternum
+    add(cyl(0.012, 0.3).rotateZ(Math.PI / 2), 'bone', 0, 0.255, 0.02);                       // collarbones
+    add(new THREE.TorusGeometry(0.11 * s, 0.026 * s, 6, 18), 'bone', 0, -0.235, -0.01, [1, 0.6, 0.75], [Math.PI / 2, 0, 0]); // pelvis
+    add(sph(1), 'lung', -0.072, 0.1, 0.0, [0.062, 0.11, 0.065]);
+    add(sph(1), 'lung', 0.075, 0.1, 0.0, [0.058, 0.105, 0.065]);
+    add(sph(0.042), 'heart', 0.022, 0.07, 0.035, [1, 1.15, 0.9]);
+    add(sph(1), 'liver', 0.055, -0.04, 0.02, [0.085, 0.045, 0.06]);
+    add(sph(1), 'stomach', -0.055, -0.035, 0.03, [0.06, 0.045, 0.045]);
+    add(sph(0.028), 'kidney', -0.07, -0.08, -0.05, [0.8, 1.2, 0.8]);
+    add(sph(0.028), 'kidney', 0.07, -0.08, -0.05, [0.8, 1.2, 0.8]);
+    add(new THREE.TorusKnotGeometry(0.055 * s, 0.018 * s, 80, 8, 3, 7), 'gut', 0, -0.165, 0.025, [1.1, 0.75, 0.6]);
+  } else if (key === 'head') {
+    const skull = add(new THREE.SphereGeometry(0.106 * s, 20, 14), mesh.userData.skullMat, 0, 0.005, -0.004);
+    skull.scale.set(1, 1.04, 1.06);
+    add(new THREE.SphereGeometry(0.09 * s, 16, 12), 'brain', 0, 0.02, -0.01, [1, 0.9, 1.1]);
+    add(new THREE.BoxGeometry(0.1 * s, 0.03 * s, 0.07 * s), 'bone', 0, -0.075, 0.04);          // jaw
+    add(cyl(0.018, 0.08), 'bone', 0, -0.1, -0.03);                                            // neck vertebra
+  } else {
+    const leg = key.includes('Leg'), up = key[0] === 'u', hl = P.he[1];
+    const r = leg ? (up ? 0.024 : 0.019) : (up ? 0.017 : 0.012);
+    add(cyl(r, hl * 2 * 0.9), 'bone', 0, 0, 0);
+    add(sph(r * 1.7, 8, 6), 'bone', 0, hl * 0.92, 0);
+    add(sph(r * 1.5, 8, 6), 'bone', 0, -hl * 0.92, 0);
+    if (!up) add(cyl(r * 0.7, hl * 2 * 0.85), 'bone', leg ? 0.022 : 0.016, 0, -0.005);  // second bone (fibula / ulna)
+  }
+  mesh.add(g);
+  return g;
+}
+function goreInit(npc, key, body, mesh, P, s) {
+  const u = mesh.material.userData.gore;
+  if (key === 'head') mesh.userData.skullMat = goreMaterial(GORE_COL.bone, { shared: u, holeScale: 0.72, meat: 0x5a0c0c, noBruise: true, rough: 0.6 });
+  const inner = buildInnards(key, mesh, s, P);
+  const half = P.r ? [P.r * s, P.r * s, P.r * s] : P.he.map(v => v * s);
+  const minH = Math.min(...half);
+  npc.gore[key] = { holes: [], bruises: [], u, inner, half, sphere: !!P.r, maxR: key === 'head' ? 0.075 * s : key === 'torso' ? 0.13 * s : minH * 1.15 };
+}
+function goreSync(g) {
+  for (let i = 0; i < GORE_H; i++) { const h = g.holes[i]; g.u.uHoles.value[i].set(h ? h.x : 0, h ? h.y : 0, h ? h.z : 0, h ? h.r : 0); }
+  for (let i = 0; i < GORE_B; i++) { const b = g.bruises[i]; g.u.uBruise.value[i].set(b ? b.x : 0, b ? b.y : 0, b ? b.z : 0, b ? b.r : 0); g.u.uBruiseK.value[i] = b ? b.k : 0; }
+  g.inner.visible = g.holes.length > 0;
+}
+function goreHeal(npc) {
+  for (const g of Object.values(npc.gore || {})) { g.holes.length = 0; g.bruises.length = 0; g.u.uChar.value = 0; goreSync(g); }
+  npc.bleed = 0; npc.charred = 0;
+}
+// Projects a part-local direction onto the part's surface
+function goreSurface(g, dir) {
+  const d = dir.clone(); if (d.lengthSq() < 1e-8) d.set(0, 0, 1); d.normalize();
+  if (g.sphere) return d.multiplyScalar(g.half[0]);
+  const t = Math.min(...[0, 1, 2].map(i => Math.abs(d.getComponent(i)) > 1e-6 ? g.half[i] / Math.abs(d.getComponent(i)) : Infinity));
+  return d.multiplyScalar(t);
+}
+function nearest(list, p) {
+  let best = null, bd = Infinity;
+  for (const it of list) { const d = Math.hypot(it.x - p.x, it.y - p.y, it.z - p.z); if (d < bd) { bd = d; best = it; } }
+  return [best, bd];
+}
+// kind: 'bruise' or 'hole'.  size in metres (radius).  worldPt on/near the part surface.
+function woundNPC(npc, key, worldPt, kind, size, o = {}) {
+  if (!state.gore || npc.removed) return;
+  const g = npc.gore?.[key]; if (!g) return;
+  const body = npc.parts[key];
+  const lp = body.pointToLocalFrame(CV(worldPt));
+  const p = V3(lp.x, lp.y, lp.z);
+  if (kind === 'hole' && state.gore === 2) {
+    const r = Math.min(size, g.maxR);
+    let [h, d] = nearest(g.holes, p);
+    if (h && d < (h.r + r) * 0.55) h.r = Math.min(g.maxR, Math.hypot(h.r, r * 0.8));
+    else if (g.holes.length >= GORE_H) h.r = Math.min(g.maxR, Math.hypot(h.r, r * 0.7));
+    else g.holes.push({ x: p.x, y: p.y, z: p.z, r });
+    npc.bleed = Math.min(25, (npc.bleed || 0) + 3 + r * 60);
+    const wp = V3(worldPt.x, worldPt.y, worldPt.z);
+    burst(wp, 0x9a1010, Math.round(4 + r * 120));
+    if (o.gibs !== false) { const n = Math.min(4, Math.round(r * 50)); for (let i = 0; i < n; i++) spawnGib(wp, o.dir, rand(0.012, 0.02) + r * 0.15, key === 'head' && Math.random() < 0.4 ? GORE_COL.brain : null); }
+    bloodSplat(wp, 0.08 + r * 2.5);
+    kind = 'bruise'; size = r * 2.2;                     // ring of bruising round every wound
+  } else if (kind === 'hole') { kind = 'bruise'; size *= 2; o = { ...o, k: 0.8 }; }
+  if (kind === 'bruise') {
+    const r = Math.min(size, Math.max(...g.half) * 1.3), k = o.k ?? 0.6;
+    let [b, d] = nearest(g.bruises, p);
+    if (b && d < (b.r + r) * 0.4) { b.k = Math.min(1, b.k + k * 0.6); b.r = Math.min(Math.max(...g.half) * 1.4, Math.max(b.r, r) * 1.08); }
+    else if (g.bruises.length >= GORE_B) { b.k = Math.min(1, b.k + k * 0.4); b.r = Math.max(b.r, r); }
+    else g.bruises.push({ x: p.x, y: p.y, z: p.z, r, k });
+  }
+  goreSync(g);
+}
+// Explosion / big blunt hit: wound the side of the part that faces the source
+function woundFacing(npc, key, srcPos, kind, size, o) {
+  const g = npc.gore?.[key]; if (!g) return;
+  const b = npc.parts[key];
+  const l = b.pointToLocalFrame(CV(srcPos));
+  const dir = V3(l.x, l.y, l.z).add(V3(rand(-0.3, 0.3), rand(-0.3, 0.3), rand(-0.3, 0.3)).multiplyScalar(V3(l.x, l.y, l.z).length()));
+  const sp = goreSurface(g, dir);
+  const w = b.pointToWorldFrame(CV(sp));
+  woundNPC(npc, key, w, kind, size, o);
+}
+// Little physical bits of meat
+const gibs = [], splats = [];
+const G_GIB = 16;
+const gibGeo = new THREE.IcosahedronGeometry(1, 0);
+function spawnGib(pos, dir, size, color) {
+  if (gibs.length >= 50) removeGib(gibs[0]);
+  const body = new CANNON.Body({ mass: 0.15, material: MAT.def, collisionFilterGroup: G_GIB, collisionFilterMask: G_WORLD, linearDamping: 0.15, angularDamping: 0.5 });
+  body.addShape(new CANNON.Sphere(size * 0.8));
+  body.position.set(pos.x, pos.y, pos.z);
+  const d = (dir ? V3(dir.x, dir.y, dir.z).normalize() : V3()).multiplyScalar(2.5).add(V3(rand(-1.6, 1.6), rand(0.5, 2.6), rand(-1.6, 1.6)));
+  body.velocity.set(d.x, d.y, d.z);
+  body.angularVelocity.set(rand(-15, 15), rand(-15, 15), rand(-15, 15));
+  world.addBody(body);
+  const mesh = new THREE.Mesh(gibGeo, new THREE.MeshStandardMaterial({ color: color ?? (Math.random() < 0.25 ? 0xd88a86 : 0x8a1812), roughness: 0.35 }));
+  mesh.scale.set(size * rand(0.8, 1.3), size * rand(0.6, 1), size * rand(0.8, 1.3));
+  mesh.castShadow = true; fxGroup.add(mesh);
+  const gib = { body, mesh, t: 0, life: rand(14, 20), sc: mesh.scale.clone() };
+  gibs.push(gib);
+}
+function removeGib(g) { gibs.splice(gibs.indexOf(g), 1); world.removeBody(g.body); fxGroup.remove(g.mesh); g.mesh.material.dispose(); }
+function updateGibs(dt) {
+  for (let i = gibs.length - 1; i >= 0; i--) {
+    const g = gibs[i]; g.t += dt;
+    const b = g.body, p = state.paused ? b.position : b.interpolatedPosition, q = state.paused ? b.quaternion : b.interpolatedQuaternion;
+    g.mesh.position.set(p.x, p.y, p.z); g.mesh.quaternion.set(q.x, q.y, q.z, q.w);
+    if (g.t > g.life - 1) g.mesh.scale.copy(g.sc).multiplyScalar(Math.max(0.01, g.life - g.t));
+    if (g.t > g.life || p.y < -60) removeGib(g);
+  }
+}
+const splatGeo = new THREE.CircleGeometry(1, 14);
+const _gr = new CANNON.RaycastResult();
+function bloodSplat(pos, r, dir) {
+  if (state.gore !== 2) return;
+  const from = new CANNON.Vec3(pos.x, pos.y + 0.05, pos.z), to = new CANNON.Vec3(pos.x + (dir?.x || 0), pos.y - 4, pos.z + (dir?.z || 0));
+  if (!world.raycastClosest(from, to, { collisionFilterMask: G_WORLD, skipBackfaces: true }, _gr)) return;
+  const n = _gr.hitNormalWorld, hp = _gr.hitPointWorld;
+  if (splats.length >= 90) { const s = splats.shift(); fxGroup.remove(s); s.material.dispose(); }
+  const m = new THREE.Mesh(splatGeo, new THREE.MeshStandardMaterial({ color: Math.random() < 0.5 ? 0x5e0808 : 0x730b0b, roughness: 0.25, transparent: true, opacity: 0.92, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 - splats.length * 0.01 }));
+  m.position.set(hp.x + n.x * 0.004, hp.y + n.y * 0.004, hp.z + n.z * 0.004);
+  m.lookAt(m.position.clone().add(V3(n.x, n.y, n.z)));
+  m.rotateZ(Math.random() * 6.3);
+  m.scale.set(r * rand(0.8, 1.3), r * rand(0.6, 1), 1);
+  m.renderOrder = 1; fxGroup.add(m); splats.push(m);
+}
+function clearGore() {
+  while (gibs.length) removeGib(gibs[0]);
+  while (splats.length) { const s = splats.pop(); fxGroup.remove(s); s.material.dispose(); }
+}
+// Per-frame bleeding and charring
+function goreThink(n, dt) {
+  if (!state.gore || !n.gore) return;
+  if (n.burn > 0) {
+    n.charred = Math.min(0.85, (n.charred || 0) + dt * 0.06);
+    for (const g of Object.values(n.gore)) g.u.uChar.value = n.charred;
+  }
+  if (!(n.bleed > 0) || state.gore !== 2) return;
+  n.bleed -= dt * (n.state === 'dead' ? 0.5 : 1);
+  n.dripT = (n.dripT || 0) - dt;
+  if (n.dripT > 0) return;
+  n.dripT = rand(0.08, 0.3) / Math.min(3, 0.5 + n.bleed / 6);
+  const keys = Object.keys(n.gore).filter(k => n.gore[k].holes.length);
+  if (!keys.length) return;
+  const k = keys[Math.floor(Math.random() * keys.length)], g = n.gore[k], h = g.holes[Math.floor(Math.random() * g.holes.length)];
+  const w = n.parts[k].pointToWorldFrame(new CANNON.Vec3(h.x, h.y, h.z));
+  const wp = V3(w.x, w.y, w.z);
+  bloodDrop(wp, n.parts[k].velocity);
+  if (Math.random() < 0.35) bloodSplat(wp, rand(0.03, 0.08));
+}
+function bloodDrop(pos, bv) {
+  const m = new THREE.Mesh(gibGeo, goreMat('heart'));
+  m.scale.setScalar(rand(0.006, 0.011)); m.position.copy(pos); fxGroup.add(m);
+  const v = V3(bv.x * 0.5 + rand(-0.3, 0.3), bv.y * 0.5 + rand(-0.2, 0.4), bv.z * 0.5 + rand(-0.3, 0.3));
+  let t = 0;
+  fx.push({ update(dt) { t += dt; v.y -= 9.8 * dt; m.position.addScaledVector(v, dt); if (t > 0.7) { fxGroup.remove(m); return false; } return true; } });
+}
+
+// ====================================================================
 //  NPC ragdolls
 // ====================================================================
 function npcOptions() {
@@ -557,6 +812,7 @@ function createNPC(pos, yaw, o) {
     type: 'npc', name: 'NPC', parts: {}, meshes: {}, constraints: [], s, state: 'active', ragTimer: 0, strength: 0.3,
     health: o.health, maxHealth: o.health, behavior: o.behavior, yaw, phase: 0, home: pos.clone(), target: null, wait: 0,
     vd: new CANNON.Vec3(), colors: { shirt: o.shirt, pants: o.pants, skin: o.skin }, mass: 0, removed: false, hurtT: 0, think: Math.random() * 2,
+    gore: {}, bleed: 0,
   };
   for (const [key, P] of Object.entries(NPC_PARTS)) {
     const wp = V3(P.x * s, P.y * s, 0).applyQuaternion(q).add(pos);
@@ -569,7 +825,7 @@ function createNPC(pos, yaw, o) {
     else { body.addShape(new CANNON.Box(new CANNON.Vec3(P.he[0] * s, P.he[1] * s, P.he[2] * s))); geo = new THREE.BoxGeometry(P.he[0] * 2 * s, P.he[1] * 2 * s, P.he[2] * 2 * s); }
     world.addBody(body);
     npc.mass += body.mass;
-    const mat = new THREE.MeshStandardMaterial({ color: o[P.role], roughness: 0.75 });
+    const mat = goreMaterial(o[P.role], { cloth: P.role !== 'skin' });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.castShadow = mesh.receiveShadow = true;
     mesh.userData = { kind: 'npc', ent: npc, body, role: P.role, baseEmissive: 0 };
@@ -587,6 +843,21 @@ function createNPC(pos, yaw, o) {
     }
     body.ent = npc; body.npcPart = key;
     npc.parts[key] = body; npc.meshes[key] = mesh;
+    goreInit(npc, key, body, mesh, P, s);
+    body.addEventListener('collide', (e) => { // bruises from any hard knock, splits from huge ones
+      if (e.body.ent === npc || !state.gore) return;
+      const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
+      if (v < 3.2) return;
+      const now = performance.now();
+      if (now - (body.lastBruise || 0) < 90) return;
+      body.lastBruise = now;
+      const c = e.contact, pw = c.bi === body ? c.bi.position.vadd(c.ri) : c.bj.position.vadd(c.rj);
+      const wp = V3(pw.x, pw.y, pw.z), heavy = e.body.mass === 0 || e.body.mass > 3;
+      queue.push(() => {
+        woundNPC(npc, key, wp, 'bruise', 0.025 + Math.min(0.06, v * 0.004), { k: Math.min(1, (v - 2.5) * 0.12) });
+        if (heavy && v > 13) woundNPC(npc, key, wp, 'hole', 0.02 + (v - 13) * 0.004, { gibs: v > 16 });
+      });
+    });
   }
   const P = npc.parts, S = (x, y, z) => new CANNON.Vec3(x * s, y * s, z * s);
   const DOWN = new CANNON.Vec3(0, -1, 0), UP = new CANNON.Vec3(0, 1, 0);
@@ -637,7 +908,7 @@ function hurtNPC(npc, dmg) {
   }
 }
 function reviveNPC(npc) {
-  npc.health = npc.maxHealth; npc.state = 'ragdoll'; npc.ragTimer = 0.3;
+  npc.health = npc.maxHealth; npc.state = 'ragdoll'; npc.ragTimer = 0.3; goreHeal(npc);
   for (const m of Object.values(npc.meshes)) m.material.color.set(npc.colors[m.userData.role]);
   npc.eyes?.forEach(e => e.scale.set(1, 1, 1));
 }
@@ -653,6 +924,7 @@ function restyleNPC(npc) {
 function npcThink(n, dt) {
   const T = n.parts.torso;
   if (!isFinite(T.position.y) || T.position.y < -60) { queue.push(() => removeEnt(n)); return; }
+  goreThink(n, dt);
   if (n.burn > 0) {
     n.burn -= dt;
     hurtNPC(n, 12 * dt);
@@ -794,7 +1066,7 @@ function detachBody(b) {
   for (const h of hands) if (h.ropeStart && h.ropeStart.body === b) h.ropeStart = null;
   world.removeBody(b);
 }
-function disposeMesh(m) { m.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose?.(); } }); m.parent?.remove(m); }
+function disposeMesh(m) { m.traverse(o => { if (o.isMesh) { o.geometry.dispose(); if (!o.userData.innard || !Object.values(goreMats).includes(o.material)) o.material.dispose?.(); } }); m.parent?.remove(m); }
 function removeEnt(ent) {
   if (!ent || ent.removed) return;
   ent.removed = true;
@@ -818,7 +1090,7 @@ function clearAll() {
   while (ropes.length) removeRope(ropes[0]);
   for (const j of joints) world.removeConstraint(j.c);
   joints.length = 0; undoStack.length = 0;
-  clearWeaponFX();
+  clearWeaponFX(); clearGore();
 }
 function undo() {
   while (undoStack.length) {
@@ -893,7 +1165,15 @@ function explode(pos, radius = 5, power = 1, o = {}) {
   }
   for (const n of npcs) {
     let maxF = 0;
-    for (const b of Object.values(n.parts)) maxF = Math.max(maxF, kick(b, 0.9));
+    for (const [k, b] of Object.entries(n.parts)) {
+      const f = kick(b, 0.9); maxF = Math.max(maxF, f);
+      if (f <= 0) continue;
+      if (o.dust) { if (f > 0.25) woundFacing(n, k, pos, 'bruise', 0.05 + f * 0.08, { k: f }); }
+      else {
+        woundFacing(n, k, pos, 'bruise', 0.06 + f * 0.12, { k: 0.4 + f * 0.6 });
+        if (f > 0.35 * (1.2 - power * 0.2)) { woundFacing(n, k, pos, 'hole', 0.03 + f * 0.09, { dir: b.position.vsub(p) }); if (f > 0.6) woundFacing(n, k, pos, 'hole', 0.02 + f * 0.06, { gibs: false }); }
+      }
+    }
     if (maxF > 0) { ragdoll(n, (o.dust ? 1.2 : 3) + maxF * 2); hurtNPC(n, (o.dmg ?? 90) * maxF); }
   }
   for (const b of balloons.slice()) if (b.mesh.position.distanceTo(pos) < radius * 0.7) popBalloon(b);
@@ -1400,6 +1680,8 @@ function hitEnt(hit, dir, o) {
   if (b.type === DYN && o.impulse) b.applyImpulse(new CANNON.Vec3(dir.x * o.impulse, dir.y * o.impulse, dir.z * o.impulse), CV(hit.point).vsub(b.position));
   if (b.ent?.type === 'npc' && o.dmg) {
     const n = b.ent, dmg = o.dmg * (b.npcPart === 'head' ? 2 : 1);
+    if (o.dmg >= 8) woundNPC(n, b.npcPart, hit.point, 'hole', clamp(0.012 + o.dmg * 0.0011, 0.016, 0.09), { dir });
+    else woundNPC(n, b.npcPart, hit.point, 'bruise', 0.04, { k: 0.5 });
     hurtNPC(n, dmg);
     ragdoll(n, dmg >= 25 ? 1.5 + dmg / 50 : 0.5);
   }
@@ -1467,6 +1749,11 @@ function meleeHit(ent, e) {
     w.lastHit = now;
     const vel = ent.body.velocity.clone(); const n = other.ent;
     queue.push(() => {
+      if (M.sharp) woundNPC(n, other.npcPart, point, 'hole', clamp(0.012 + v * 0.0045, 0.02, 0.08), { dir: vel });
+      else {
+        woundNPC(n, other.npcPart, point, 'bruise', clamp(0.03 + v * 0.006, 0.04, 0.12), { k: clamp(v * 0.1, 0.3, 1) });
+        if (v * M.knock * (M.quake ? 2.5 : 1) > 30) woundNPC(n, other.npcPart, point, 'hole', clamp(v * 0.004, 0.03, 0.09), { dir: vel }); // crushing blow
+      }
       hurtNPC(n, v * M.dmg * (other.npcPart === 'head' ? 1.6 : 1));
       ragdoll(n, 1 + v * 0.2);
       other.applyImpulse(vel.scale(M.knock * other.mass * 0.35));
@@ -1564,7 +1851,7 @@ const WEAPONS = [
     },
   },
   {
-    name: 'Sword', sub: 'Swing it · trigger auto-slashes', mass: 1.5, melee: { dmg: 7, knock: 1.2 }, shapes: [{ size: [0.06, 0.04, 1.05], off: [0, 0, -0.42] }],
+    name: 'Sword', sub: 'Swing it · trigger auto-slashes', mass: 1.5, melee: { dmg: 7, knock: 1.2, sharp: true }, shapes: [{ size: [0.06, 0.04, 1.05], off: [0, 0, -0.42] }],
     muzzle: [0, 0, -0.9], rate: 0.42, recoil: 0, holdPitch: 0.55,
     build(g) {
       wpart(g, zcyl(0.02, 0.02, 0.2, 10), wcol(0x3a2414, { m: 0, r: 0.9 }), 0, 0, 0.02);
@@ -2311,7 +2598,9 @@ function drawMenu() {
     mbtn(672, 398, 320, 66, 'Reset map', () => loadMap(state.map), { size: 24 });
     mbtn(32, 478, 470, 66, 'Undo last spawn', () => undo(), { size: 24 });
     mbtn(522, 478, 470, 66, state.snap ? 'VR turning: snap 30°' : 'VR turning: smooth', () => state.snap = !state.snap, { size: 24 });
-    mlabel(40, 590, 'Floor tiles are 1 m squares. Ropes act like stretchy cords: they only pull.');
+    mbtn(32, 558, 470, 66, `Gore: ${GORE_MODES[state.gore]}`, () => { state.gore = cyc(state.gore, GORE_MODES.length, 1); if (!state.gore) { npcs.forEach(goreHeal); clearGore(); } }, { active: state.gore === 2, size: 24 });
+    mbtn(522, 558, 470, 66, 'Clean up blood', () => { clearGore(); }, { size: 24 });
+    mlabel(40, 644, 'Floor tiles are 1 m squares. Ropes act like stretchy cords: they only pull.', { font: '500 17px "IBM Plex Sans", sans-serif' });
   }
   g.fillStyle = C.line; g.fillRect(32, 664, MW - 64, 2);
   mlabel(32, 692, `Tool: ${TOOLS[state.tool].name}   ·   Item: ${ITEMS[state.item].name}   ·   ${GRAVITIES[state.gravity].name} gravity   ·   ${TIMES[state.time].name}${state.paused ? ' (paused)' : ''}`, { font: '600 20px "IBM Plex Sans", sans-serif', color: C.fg });
@@ -2827,6 +3116,7 @@ renderer.setAnimationLoop(() => {
   if (!state.paused) world.step(FIXED, dt * TIMES[state.time].s, 5);
   while (queue.length) queue.shift()();
   syncStuck();
+  updateGibs(dt);
   for (let i = timers.length - 1; i >= 0; i--) { timers[i].t -= dt; if (timers[i].t <= 0) { const f = timers[i].fn; timers.splice(i, 1); f(); } }
   syncVisuals(dt);
   for (let i = fx.length - 1; i >= 0; i--) if (!fx[i].update(dt)) fx.splice(i, 1);
@@ -2848,5 +3138,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, rig };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, rig, woundNPC, hitEnt, gibs, splats, camera };
 </script>

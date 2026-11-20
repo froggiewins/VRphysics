@@ -8,6 +8,10 @@ Play: open `index.html` over HTTPS (GitHub Pages works) in a WebXR browser such 
 
 Twelve weapons live in the Weapons tab of the menu: Pistol, Shotgun, SMG, Rocket Launcher, Grenade, Crossbow, Sword, Baseball Bat, Sledgehammer, Flamethrower, Lightning Gun and Freeze Ray. They are physical objects, so you can drop, throw and pick them up again. Melee weapons hit with real swings. Headshots do double damage, burning NPCs panic, and lightning arcs between nearby NPCs.
 
+## Gore
+
+NPCs have a skeleton (skull, spine, ribs, pelvis and limb bones) and organs (brain, lungs, heart, liver, stomach, kidneys and intestines) inside them. Bullets, blades, explosions and very hard impacts take chunks out of the body so you can see inside, throw out bits of meat and leave blood on the ground. Wounded NPCs keep bleeding for a while. Blunt hits, falls and being thrown into things leave bruises that darken with repeated hits, and fire chars the skin. Reviving an NPC heals it. Set **World → Gore** to Full, Bruises only or Off. **Clean up blood** removes the mess.
+
 ## Weapon Workshop
 
 The Workshop tab lets you make your own weapon in four steps:
