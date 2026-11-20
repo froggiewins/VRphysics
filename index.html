@@ -64,7 +64,7 @@ kbd { font: 600 11px var(--display); background: #0b0f14; border: 1px solid var(
 <div id="start">
   <div class="card">
     <h1>Ragdoll<span>Lab</span></h1>
-    <p class="lede">A physics sandbox for VR and desktop. Spawn crates, bombs, carts and customisable ragdoll NPCs, then grab, throw, freeze, tie up and blow up everything across five maps, from a warehouse to the Moon at 1.62 m/s². Twelve weapons, from a pistol to a freeze ray, live in the Weapons tab of the menu.</p>
+    <p class="lede">A physics sandbox for VR and desktop. Spawn crates, bombs, carts and customisable ragdoll NPCs, then grab, throw, freeze, tie up and blow up everything across five maps, from a warehouse to the Moon at 1.62 m/s². Twelve weapons, from a pistol to a freeze ray, live in the Weapons tab of the menu, and the Workshop tab lets you draw your own in the air.</p>
     <div class="btns">
       <button class="big primary" id="playDesk">Play on desktop</button>
       <button class="big" id="playVR" disabled>Enter VR</button>
@@ -1166,7 +1166,7 @@ for (let i = 0; i < 2; i++) {
   h.ctrl.addEventListener('disconnected', () => { h.src = null; h.active = false; releaseHold(h); });
   h.ctrl.addEventListener('selectstart', () => toolDown(h));
   h.ctrl.addEventListener('selectend', () => toolUp(h));
-  h.ctrl.addEventListener('squeezestart', () => { if (h.held) { if (h.held.weapon) h.heldVia = 'grip'; return; } grabStart(h, 'grip'); });
+  h.ctrl.addEventListener('squeezestart', () => { if (ws.active) return; if (h.held) { if (h.held.weapon) h.heldVia = 'grip'; return; } grabStart(h, 'grip'); });
   h.ctrl.addEventListener('squeezeend', () => { if (h.heldVia === 'grip') releaseHold(h); });
   vrHands.push(h); hands.push(h);
 }
@@ -1255,6 +1255,7 @@ function holdControl(hand) {
 function toolDown(hand) {
   initAudio();
   if (menu.visible && hand.menuHover >= 0) { clickMenu(hand.menuHover, hand); hand.pulse(0.3, 20); return; }
+  if (ws.active) { wsDown(hand); return; }
   if (hand.held?.weapon) { hand.firing = true; hand.firePressed = true; return; }
   const tool = TOOLS[state.tool].id;
   if (tool === 'grab') { grabStart(hand, 'trigger'); return; }
@@ -1263,6 +1264,7 @@ function toolDown(hand) {
 }
 function toolUp(hand) {
   hand.pushing = false; hand.firing = false; hand.beamEnd = null;
+  if (ws.active) wsUp(hand);
   if (hand.heldVia === 'trigger') releaseHold(hand);
 }
 function useTool(tool, hand, h) {
@@ -1407,7 +1409,7 @@ function shoot(h, ent, M, D, o) {
   if (o.spread) dir.add(V3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(o.spread)).normalize();
   const hit = castRay(M, dir, 150, ent);
   const end = hit ? hit.point : M.clone().addScaledVector(dir, 150);
-  beamMesh(M, end, o.color || 0xffe2a0, 0.008, 0.06);
+  beamMesh(M, end, o.color || 0xffe2a0, o.thick || 0.008, o.life || 0.06);
   if (hit) hitEnt(hit, dir, o);
 }
 function twitch(n) { for (const b of Object.values(n.parts)) if (b.type === DYN) { b.angularVelocity.x += rand(-6, 6); b.angularVelocity.z += rand(-6, 6); b.velocity.y += rand(0, 1.2); } }
@@ -1457,6 +1459,10 @@ function meleeHit(ent, e) {
   const pw = c.bi === ent.body ? c.bi.position.vadd(c.ri) : c.bj.position.vadd(c.rj);
   const point = V3(pw.x, pw.y, pw.z);
   const hand = ent.heldBy;
+  if (M.zone) { // drawn weapons only hurt with the part painted as damaging
+    const lp = ent.body.pointToLocalFrame(pw);
+    if (!M.zone.some(z => Math.hypot(z.x - lp.x, z.y - lp.y, z.z - lp.z) < M.zoneR)) return;
+  }
   if (other.ent?.type === 'npc' && v > 2.5) {
     w.lastHit = now;
     const vel = ent.body.velocity.clone(); const n = other.ent;
@@ -1675,7 +1681,7 @@ const WEAPONS = [
   },
 ];
 function makeWeapon(i, pos, quat) {
-  const d = WEAPONS[i];
+  const d = typeof i === 'number' ? WEAPONS[i] : i;
   const g = new THREE.Group(); d.build(g);
   const shapes = d.shapes.map(s => ({ shape: s.r ? new CANNON.Sphere(s.r) : new CANNON.Box(new CANNON.Vec3(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2)), offset: new CANNON.Vec3(...(s.off || [0, 0, 0])) }));
   const ent = makeProp({ shapes, mesh: g, mass: d.mass, pos, quat, kind: 'weapon', name: d.name, sound: d.melee && d.name !== 'Sledgehammer' ? 'wood' : 'metal', angDamping: 0.1 });
@@ -1706,7 +1712,7 @@ function equipWeapon(i, hand) {
   holdWeapon(hand, ent, 'equip');
   setMenuVisible(false);
   if (hand.kind === 'desk') tryLock();
-  toast(WEAPONS[i].name);
+  toast(ent.weapon.def.name);
 }
 function throwWeapon(hand) {
   const b = hand.held.body;
@@ -1815,6 +1821,344 @@ function clearWeaponFX() {
 }
 
 // ====================================================================
+//  Weapon Workshop: air-draw a weapon, pick ranged or melee, mark the grip
+//  and the damaging part, then it becomes a real weapon you can hold
+// ====================================================================
+const WS_COLORS = ['#d9dee6', '#2b3038', '#c0392b', '#e8a23a', '#36b37e', '#2f7fe0', '#8e5bd6', '#8a5a2b'];
+const WS_THICK = [{ name: 'Thin', r: 0.008 }, { name: 'Medium', r: 0.015 }, { name: 'Thick', r: 0.026 }];
+const WS_AMMO = ['Bullets', 'Laser', 'Rockets', 'Scatter'];
+const WS_STEPS = ['draw', 'type', 'grip', 'zone'];
+const WS_STEP_NAMES = ['Draw', 'Type', 'Grip', 'Damage'];
+const WS_KEY = 'ragdollLab.customWeapons.v1';
+const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, kind: null, ammo: 0, auto: false, grip: null, muzzle: null, zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false };
+const customWeapons = []; // { data, def }
+let customCounter = 0;
+
+function strokeMesh(pts, r, color, emissive = 0) {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.2, emissive });
+  if (pts.length >= 2) {
+    const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal');
+    g.add(new THREE.Mesh(new THREE.TubeGeometry(curve, Math.min(800, Math.max(2, pts.length * 2)), r, 8, false), mat));
+  }
+  const cap = new THREE.SphereGeometry(r, 10, 8);
+  for (const p of pts.length > 1 ? [pts[0], pts[pts.length - 1]] : [pts[0]]) { const m = new THREE.Mesh(cap, mat); m.position.copy(p); g.add(m); }
+  g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  return g;
+}
+function saveCustom() {
+  try { localStorage.setItem(WS_KEY, JSON.stringify({ counter: customCounter, list: customWeapons.map(c => c.data) })); } catch (e) {}
+  menu.dirty = true;
+}
+function loadCustom() {
+  try {
+    const raw = localStorage.getItem(WS_KEY); if (!raw) return;
+    const o = JSON.parse(raw); customCounter = o.counter || 0;
+    for (const data of o.list || []) customWeapons.push({ data, def: customDef(data) });
+  } catch (e) {}
+}
+function customDef(data) {
+  const V = (a) => new THREE.Vector3(a[0], a[1], a[2]);
+  const strokes = data.strokes.map(s => ({ c: s.c, r: s.r, pts: s.pts.map(V) }));
+  let shapes = [], len = 0;
+  for (const s of strokes) {
+    const step = Math.max(s.r * 2, 0.035); let acc = step;
+    for (let i = 0; i < s.pts.length; i++) {
+      if (i > 0) { const d = s.pts[i].distanceTo(s.pts[i - 1]); len += d; acc += d; }
+      if (acc >= step || i === s.pts.length - 1) { acc = 0; shapes.push({ r: Math.max(s.r, 0.02), off: s.pts[i].toArray() }); }
+    }
+  }
+  while (shapes.length > 48) shapes = shapes.filter((_, i) => i % 2 === 0);
+  const melee = data.kind === 'melee';
+  const zone = (data.zone || []).map(V);
+  const maxR = Math.max(...strokes.map(s => s.r));
+  const ammo = data.ammo || 0;
+  return {
+    name: data.name, custom: true,
+    sub: melee ? 'Your drawing · melee' : `Your drawing · ${WS_AMMO[ammo]}${data.auto ? ' · auto' : ''}`,
+    mass: clamp(len * 1.2, 0.6, 9), shapes,
+    muzzle: data.muzzle || [0, 0, -0.3],
+    rate: melee ? 0.42 : ammo === 2 ? 1.0 : ammo === 3 ? 0.6 : data.auto ? 0.09 : 0.2,
+    recoil: melee ? 0 : ammo === 2 ? 2.5 : ammo === 3 ? 2 : 0.7,
+    auto: !melee && !!data.auto, holdPitch: melee ? 0.55 : 0,
+    melee: melee ? { dmg: 6, knock: 2, zone, zoneR: maxR * 2 + 0.045 } : null,
+    build(g) {
+      for (const s of strokes) g.add(strokeMesh(s.pts, s.r, s.c));
+      if (melee) {
+        const glow = new THREE.MeshStandardMaterial({ color: 0xff4a3a, emissive: 0xff2a10, emissiveIntensity: 0.9, transparent: true, opacity: 0.55, depthWrite: false });
+        const geo = new THREE.SphereGeometry(maxR * 1.35, 8, 6);
+        zone.forEach((p, i) => { if (i % 2 === 0) { const m = new THREE.Mesh(geo, glow); m.position.copy(p); g.add(m); } });
+      } else {
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(maxR * 1.8 + 0.006, 0.004, 6, 18), new THREE.MeshStandardMaterial({ color: 0xffb020, emissive: 0xff8a00, emissiveIntensity: 1 }));
+        ring.position.copy(V(data.muzzle)); g.add(ring);
+      }
+    },
+    fire(h, e, M, D) {
+      if (melee) { h.swingT = SWING_T; SFX.whoosh(); return; }
+      if (ammo === 0) { shoot(h, e, M, D, { dmg: 24, impulse: 12, spread: data.auto ? 0.02 : 0.005 }); SFX.shot(data.auto ? 2 : 0); flashAt(M); }
+      else if (ammo === 1) { shoot(h, e, M, D, { dmg: 30, impulse: 6, spread: 0.002, color: 0xff3b6b, thick: 0.02, life: 0.12 }); SFX.zap(); flashAt(M, 0xff3b6b, 6); }
+      else if (ammo === 2) WEAPONS[3].fire(h, e, M, D);
+      else { for (let i = 0; i < 6; i++) shoot(h, e, M, D, { dmg: 12, impulse: 7, spread: 0.07 }); SFX.shot(1); flashAt(M, 0xffc070, 12); }
+    },
+  };
+}
+
+function wsStart() {
+  if (ws.active) return;
+  for (const h of hands) { if (h.held) releaseHold(h); h.pushing = false; h.firing = false; }
+  Object.assign(ws, { active: true, step: 'draw', strokes: [], kind: null, grip: null, muzzle: null, zone: new Set(), msg: '' });
+  const head = V3(), fwd = V3();
+  camera.getWorldPosition(head); camera.getWorldDirection(fwd);
+  fwd.y = 0; if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
+  const inVR = renderer.xr.isPresenting;
+  ws.center.copy(head).addScaledVector(fwd, inVR ? 0.55 : 1.4); ws.center.y = head.y - (inVR ? 0.12 : 0);
+  ws.group = new THREE.Group(); scene.add(ws.group);
+  ws.strokeGroup = new THREE.Group(); ws.markGroup = new THREE.Group(); ws.group.add(ws.strokeGroup, ws.markGroup);
+  const frame = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.9, 0.9, 0.9)), new THREE.LineBasicMaterial({ color: 0x3fd0c9, transparent: true, opacity: 0.35 }));
+  frame.position.copy(ws.center); ws.group.add(frame);
+  const grid = new THREE.GridHelper(0.9, 9, 0x3fd0c9, 0x2a3646); grid.position.copy(ws.center); grid.position.y -= 0.45;
+  grid.material.transparent = true; grid.material.opacity = 0.5; ws.group.add(grid);
+  ws.cursors = new Map();
+  for (const h of hands) { const c = new THREE.Mesh(new THREE.SphereGeometry(0.012, 10, 8), new THREE.MeshBasicMaterial({ color: 0xffffff })); c.visible = false; ws.group.add(c); ws.cursors.set(h, c); }
+  if (!inVR) { ws.saveRig.copy(rig.position); ws.saveYaw = desk.yaw; ws.savePitch = desk.pitch; ws.orbitDist = 1.4; desk.pitch = 0; document.exitPointerLock?.(); }
+  menu.page = 'workshop';
+  rig.add(menu.mesh); menu.mesh.material.depthTest = true; menu.mesh.scale.setScalar(inVR ? 0.85 : 0.9);
+  menu.visible = true; menu.mesh.visible = true; menu.dirty = true;
+  placeWorkshopPanel();
+  updateHUD(); updateLockUI();
+}
+function placeWorkshopPanel() {
+  if (!renderer.xr.isPresenting) { // desktop: pin the panel to the left of the view
+    if (menu.mesh.parent !== camera) camera.add(menu.mesh);
+    menu.mesh.material.depthTest = false;
+    menu.mesh.position.set(-0.43, 0.02, -0.75); menu.mesh.rotation.set(0, 0.3, 0); menu.mesh.scale.setScalar(0.66);
+    return;
+  }
+  const head = V3(); camera.getWorldPosition(head);
+  const toC = ws.center.clone().sub(head); toC.y = 0;
+  if (toC.lengthSq() < 1e-4) toC.set(0, 0, -1); toC.normalize();
+  const right = V3(-toC.z, 0, toC.x);
+  const inVR = renderer.xr.isPresenting;
+  const p = ws.center.clone().addScaledVector(right, inVR ? -0.62 : -0.8).addScaledVector(toC, inVR ? -0.15 : -0.35);
+  p.y = ws.center.y - (inVR ? 0.05 : 0);
+  menu.mesh.position.copy(rig.worldToLocal(p.clone()));
+  menu.mesh.updateMatrixWorld();
+  menu.mesh.lookAt(head);
+}
+function wsEnd() {
+  ws.active = false;
+  for (const h of hands) { h.wsStroke = null; h.wsPaint = false; }
+  if (ws.group) { disposeMesh(ws.group); ws.group = null; }
+  if (!renderer.xr.isPresenting) { rig.position.copy(ws.saveRig); desk.yaw = ws.saveYaw; desk.pitch = ws.savePitch; camera.rotation.set(desk.pitch, desk.yaw, 0); }
+  menu.page = 'workshop';
+  attachMenu(); menu.dirty = true; updateHUD(); updateLockUI();
+}
+function wsTip(hand) {
+  if (hand.kind === 'vr') return hand.origin.clone().addScaledVector(hand.dir, 0.04);
+  const n = V3(); camera.getWorldDirection(n);
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, ws.center);
+  return new THREE.Ray(hand.origin, hand.dir).intersectPlane(plane, V3());
+}
+function wsNearest(p, maxD) {
+  let best = null, bd = maxD;
+  ws.strokes.forEach((s, si) => s.pts.forEach((q, i) => { const d = q.distanceTo(p); if (d < bd) { bd = d; best = { p: q, s: si, i }; } }));
+  return best;
+}
+function wsPick(hand) {
+  if (hand.kind === 'vr') { const n = wsNearest(wsTip(hand), 0.05); if (n) return n; }
+  raycaster.set(hand.origin, hand.dir);
+  const hit = raycaster.intersectObject(ws.strokeGroup, true)[0];
+  return hit ? wsNearest(hit.point, 0.15) : null;
+}
+function wsInvalidate() { ws.grip = null; ws.muzzle = null; ws.zone.clear(); ws.marksDirty = true; menu.dirty = true; }
+function wsUndo() {
+  if (!ws.active || ws.step !== 'draw') return;
+  const s = ws.strokes.pop(); if (!s) return;
+  if (s.mesh) disposeMesh(s.mesh);
+  for (const h of hands) if (h.wsStroke === s) h.wsStroke = null;
+  wsInvalidate();
+}
+function wsClear() { while (ws.strokes.length) wsUndo(); }
+function wsGo(d) {
+  const si = WS_STEPS.indexOf(ws.step);
+  if (d > 0) {
+    if (ws.step === 'draw' && !ws.strokes.length) { ws.msg = 'Draw something first.'; return; }
+    if (ws.step === 'type' && !ws.kind) { ws.msg = 'Pick Ranged or Melee.'; return; }
+    if (ws.step === 'grip' && !ws.grip) { ws.msg = 'Mark where you hold it.'; return; }
+  }
+  ws.msg = ''; ws.step = WS_STEPS[clamp(si + d, 0, 3)]; ws.marksDirty = true;
+}
+function wsDown(hand) {
+  if (ws.step === 'draw') {
+    const p = wsTip(hand); if (!p) return;
+    hand.wsStroke = { pts: [p], color: WS_COLORS[ws.color], r: WS_THICK[ws.thick].r, mesh: null, dirty: true };
+    ws.strokes.push(hand.wsStroke); wsInvalidate();
+  } else if (ws.step === 'grip') {
+    const n = wsPick(hand);
+    if (n) { ws.grip = n.p.clone(); ws.msg = ''; SFX.click(); hand.pulse(0.4, 30); ws.marksDirty = true; menu.dirty = true; }
+  } else if (ws.step === 'zone') {
+    if (ws.kind === 'ranged') {
+      const n = wsPick(hand);
+      if (n) { ws.muzzle = n.p.clone(); ws.msg = ''; SFX.click(); hand.pulse(0.4, 30); ws.marksDirty = true; menu.dirty = true; }
+    } else hand.wsPaint = true;
+  }
+}
+function wsUp(hand) {
+  if (hand.wsStroke) { hand.wsStroke.dirty = true; hand.wsStroke = null; menu.dirty = true; }
+  hand.wsPaint = false;
+}
+function wsMarkers() {
+  while (ws.markGroup.children.length) disposeMesh(ws.markGroup.children[0]);
+  const si = WS_STEPS.indexOf(ws.step);
+  if (ws.grip && si >= 2) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.028, 14, 10), new THREE.MeshBasicMaterial({ color: 0x3fd0c9, transparent: true, opacity: 0.85, depthTest: false }));
+    m.position.copy(ws.grip); m.renderOrder = 997; ws.markGroup.add(m);
+  }
+  if (si === 3 && ws.kind === 'ranged' && ws.muzzle) {
+    const m = new THREE.Mesh(new THREE.ConeGeometry(0.025, 0.07, 12), new THREE.MeshBasicMaterial({ color: 0xffb020, depthTest: false }));
+    m.position.copy(ws.muzzle); m.renderOrder = 997;
+    if (ws.grip) m.quaternion.setFromUnitVectors(V3(0, 1, 0), ws.muzzle.clone().sub(ws.grip).normalize());
+    ws.markGroup.add(m);
+  }
+  if (si === 3 && ws.kind === 'melee') {
+    const mat = new THREE.MeshBasicMaterial({ color: 0xff3b3b, transparent: true, opacity: 0.7, depthWrite: false });
+    for (const k of ws.zone) {
+      const [s, i] = k.split(':').map(Number); const st = ws.strokes[s]; if (!st) continue;
+      const m = new THREE.Mesh(new THREE.SphereGeometry(st.r * 1.4, 8, 6), mat); m.position.copy(st.pts[i]); ws.markGroup.add(m);
+    }
+  }
+}
+function wsUpdate(dt) {
+  if (!ws.active) return;
+  const inVR = renderer.xr.isPresenting;
+  if (!inVR) {
+    const cp = Math.cos(desk.pitch);
+    const fwd = V3(-Math.sin(desk.yaw) * cp, Math.sin(desk.pitch), -Math.cos(desk.yaw) * cp);
+    const cam = ws.center.clone().addScaledVector(fwd, -ws.orbitDist);
+    rig.position.set(cam.x, cam.y - 1.6, cam.z); camera.rotation.set(desk.pitch, desk.yaw, 0);
+    camera.updateMatrixWorld();
+  }
+  for (const h of hands) {
+    const cur = ws.cursors.get(h);
+    if (!h.active) { if (cur) cur.visible = false; continue; }
+    if (cur) {
+      const t = ws.step === 'draw' && !h.overMenu ? wsTip(h) : null;
+      cur.visible = !!t; if (t) { cur.position.copy(t); cur.material.color.set(WS_COLORS[ws.color]); cur.scale.setScalar(WS_THICK[ws.thick].r / 0.012); }
+    }
+    if (h.wsStroke) {
+      const p = wsTip(h), s = h.wsStroke;
+      const last = s.pts[s.pts.length - 1];
+      if (p && p.distanceTo(last) > (inVR ? 0.008 : 0.01)) {
+        const n = Math.min(40, Math.ceil(p.distanceTo(last) / 0.012)); // fill gaps from fast strokes
+        for (let k = 1; k <= n; k++) s.pts.push(last.clone().lerp(p, k / n));
+        s.dirty = true;
+        if (s.pts.length >= 400) { wsUp(h); wsDown(h); }
+      }
+    }
+    if (h.wsPaint) {
+      const n = wsPick(h);
+      if (n) {
+        const before = ws.zone.size;
+        ws.strokes.forEach((s, si) => s.pts.forEach((q, i) => { if (q.distanceTo(n.p) < 0.035) ws.zone.add(`${si}:${i}`); }));
+        if (ws.zone.size !== before) { ws.marksDirty = true; menu.dirty = true; ws.msg = ''; h.pulse(0.1, 8); }
+      }
+    }
+  }
+  for (const s of ws.strokes) if (s.dirty) {
+    if (s.mesh) disposeMesh(s.mesh);
+    s.mesh = strokeMesh(s.pts, s.r, s.color); ws.strokeGroup.add(s.mesh); s.dirty = false;
+  }
+  if (ws.marksDirty) { ws.marksDirty = false; wsMarkers(); }
+}
+function wsBuildData() {
+  const grip = ws.grip;
+  const zonePts = [...ws.zone].map(k => { const [s, i] = k.split(':').map(Number); return ws.strokes[s].pts[i]; });
+  let target = ws.kind === 'ranged' ? ws.muzzle : zonePts.reduce((a, p) => a.add(p), V3()).multiplyScalar(1 / zonePts.length);
+  let fwd = target.clone().sub(grip);
+  if (fwd.length() < 0.04) {
+    let far = grip, fd = 0;
+    for (const s of ws.strokes) for (const p of s.pts) { const d = p.distanceTo(grip); if (d > fd) { fd = d; far = p; } }
+    fwd = far.clone().sub(grip);
+  }
+  if (fwd.lengthSq() < 1e-8) fwd.set(0, 0, -1);
+  fwd.normalize();
+  let up = V3(0, 1, 0).addScaledVector(fwd, -fwd.y);
+  if (up.lengthSq() < 1e-3) up = V3(0, 0, 1).addScaledVector(fwd, -fwd.z);
+  up.normalize();
+  const z = fwd.clone().negate(), x = up.clone().cross(z).normalize(), y = z.clone().cross(x);
+  const qi = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z)).invert();
+  const L = (p) => p.clone().sub(grip).applyQuaternion(qi);
+  const r4 = (v) => [+v.x.toFixed(4), +v.y.toFixed(4), +v.z.toFixed(4)];
+  return {
+    name: `Custom ${++customCounter}`, kind: ws.kind, ammo: ws.ammo, auto: ws.auto,
+    strokes: ws.strokes.map(s => ({ c: s.color, r: s.r, pts: s.pts.map(p => r4(L(p))) })),
+    zone: zonePts.map(p => r4(L(p))), muzzle: ws.muzzle ? r4(L(ws.muzzle)) : null,
+  };
+}
+function wsFinish(hand) {
+  if (ws.kind === 'ranged' && !ws.muzzle) { ws.msg = 'Mark the barrel tip first.'; return; }
+  if (ws.kind === 'melee' && !ws.zone.size) { ws.msg = 'Paint the damaging part first.'; return; }
+  const data = wsBuildData();
+  const def = customDef(data);
+  customWeapons.push({ data, def }); saveCustom();
+  wsEnd();
+  equipWeapon(def, hand);
+  SFX.spawn();
+}
+function drawWorkshopPage() {
+  if (!ws.active) {
+    wrapText('Draw a weapon in the air, choose ranged or melee, mark where you hold it, then mark the part that does the damage. Weapons you make are saved in this browser.', 40, 180, 940);
+    mbtn(32, 250, 460, 84, 'Start drawing', () => wsStart(), { active: true, size: 30 });
+    mlabel(40, 372, 'YOUR WEAPONS', { font: '700 18px "Chakra Petch", sans-serif' });
+    if (!customWeapons.length) mlabel(40, 412, 'Nothing yet. Weapons you finish show up here.');
+    const start = Math.max(0, customWeapons.length - 6);
+    customWeapons.slice(start).forEach((c, k) => {
+      const i = start + k, x = 32 + (k % 2) * 490, y = 394 + Math.floor(k / 2) * 84;
+      mbtn(x, y, 390, 74, c.def.name, () => equipWeapon(c.def, menu.clickHand), { sub: c.def.sub, left: true, size: 24 });
+      mbtn(x + 398, y, 72, 74, '✕', () => { customWeapons.splice(i, 1); saveCustom(); }, { size: 26 });
+    });
+    return;
+  }
+  const si = WS_STEPS.indexOf(ws.step), vr = renderer.xr.isPresenting;
+  const text = {
+    draw: vr ? 'Hold the trigger and draw in the air inside the glowing box. Draw the handle too. Y undoes the last stroke.'
+      : 'Hold the left mouse button and drag to draw. Right-drag to look around the drawing, wheel to zoom. Z undoes the last stroke.',
+    type: 'Is this a ranged weapon or a melee weapon?',
+    grip: vr ? 'Touch your drawing with the controller tip, or point at it, and pull the trigger where your hand holds it.' : 'Click on your drawing where your hand holds it.',
+    zone: ws.kind === 'ranged' ? 'Mark the barrel tip. Shots come out there, aimed away from the grip.'
+      : 'Hold the trigger (or left mouse) and paint over the part that does damage, like a blade edge or a hammer head. Only the painted part hurts.',
+  }[ws.step];
+  wrapText(text, 40, 180, 940);
+  if (ws.step === 'draw') {
+    stepper(250, 'Colour', 'Colour', () => ws.color = cyc(ws.color, WS_COLORS.length, -1), () => ws.color = cyc(ws.color, WS_COLORS.length, 1), WS_COLORS[ws.color]);
+    stepper(320, 'Thickness', WS_THICK[ws.thick].name, () => ws.thick = Math.max(0, ws.thick - 1), () => ws.thick = Math.min(2, ws.thick + 1));
+    mbtn(32, 404, 270, 66, 'Undo stroke', () => wsUndo(), { size: 24 });
+    mbtn(312, 404, 270, 66, 'Clear all', () => wsClear(), { size: 24 });
+    const pts = ws.strokes.reduce((a, s) => a + s.pts.length, 0);
+    mlabel(40, 500, `${ws.strokes.length} stroke${ws.strokes.length === 1 ? '' : 's'} · ${pts} points`);
+  } else if (ws.step === 'type') {
+    mbtn(32, 250, 470, 100, 'Ranged', () => ws.kind = 'ranged', { active: ws.kind === 'ranged', sub: 'Shoots from a barrel tip you choose', size: 32 });
+    mbtn(522, 250, 470, 100, 'Melee', () => ws.kind = 'melee', { active: ws.kind === 'melee', sub: 'Hurts with the part you paint', size: 32 });
+    if (ws.kind === 'ranged') {
+      stepper(384, 'Ammo', WS_AMMO[ws.ammo], () => ws.ammo = cyc(ws.ammo, WS_AMMO.length, -1), () => ws.ammo = cyc(ws.ammo, WS_AMMO.length, 1));
+      stepper(454, 'Fire mode', ws.auto ? 'Full auto' : 'Single shot', () => ws.auto = !ws.auto, () => ws.auto = !ws.auto);
+    } else if (ws.kind === 'melee') mlabel(40, 414, 'Damage scales with how fast you swing it.');
+  } else if (ws.step === 'grip') {
+    mlabel(40, 300, ws.grip ? 'Grip set. Click again to move it.' : 'No grip set yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: ws.grip ? C.accent2 : C.muted });
+  } else if (ws.step === 'zone') {
+    if (ws.kind === 'ranged') mlabel(40, 300, ws.muzzle ? 'Barrel tip set.' : 'No barrel tip set yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: ws.muzzle ? C.accent2 : C.muted });
+    else {
+      mlabel(40, 300, ws.zone.size ? `${ws.zone.size} points marked as damaging.` : 'Nothing painted yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: ws.zone.size ? C.accent2 : C.muted });
+      mbtn(32, 340, 270, 66, 'Clear paint', () => { ws.zone.clear(); ws.marksDirty = true; }, { size: 24 });
+    }
+  }
+  if (ws.msg) mlabel(40, 560, ws.msg, { color: C.accent, font: '600 24px "IBM Plex Sans", sans-serif' });
+  mbtn(32, 584, 210, 64, si === 0 ? 'Cancel' : 'Back', () => (si === 0 ? wsEnd() : wsGo(-1)), { size: 24 });
+  if (si > 0) mbtn(252, 584, 210, 64, 'Cancel', () => wsEnd(), { size: 24 });
+  mbtn(692, 584, 300, 64, si === 3 ? 'Finish & equip' : 'Next', () => (si === 3 ? wsFinish(menu.clickHand) : wsGo(1)), { active: true, size: 24 });
+}
+
+// ====================================================================
 //  Menu panel (canvas texture, works in VR on the left wrist and on desktop)
 // ====================================================================
 const MW = 1024, MH = 720;
@@ -1860,12 +2204,20 @@ function drawMenu() {
   g.fillStyle = C.fg; g.fillText('RAGDOLL', 32, 62); const w = g.measureText('RAGDOLL').width;
   g.fillStyle = C.accent; g.fillText('LAB', 32 + w + 6, 62);
   mlabel(MW - 32, 48, `${MAPS[state.map].name} · ${props.length} props · ${npcs.length} NPCs`, { align: 'right', font: '600 20px "IBM Plex Sans", sans-serif' });
-  const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World']];
-  tabs.forEach(([id, name], i) => mbtn(32 + i * 160, 88, 152, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 24 }));
-  const P = menu.page;
+  const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['workshop', 'Workshop'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World']];
+  if (ws.active) {
+    const si = WS_STEPS.indexOf(ws.step);
+    WS_STEP_NAMES.forEach((n, i) => {
+      const x = 32 + i * 242; rr(g, x, 88, 232, 56, 10);
+      g.fillStyle = i === si ? C.accent : i < si ? '#24402f' : C.btn; g.fill();
+      mlabel(x + 116, 117, `${i + 1}  ${n}`, { align: 'center', color: i === si ? '#1a1205' : C.fg, font: '700 24px "Chakra Petch", sans-serif' });
+    });
+  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 137, 88, 129, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 21 }));
+  const P = ws.active ? 'workshop' : menu.page;
+  if (P === 'workshop') drawWorkshopPage();
   if (P === 'weapons') {
     WEAPONS.forEach((w, i) => mbtn(32 + (i % 3) * 323, 160 + Math.floor(i / 3) * 92, 313, 84, w.name, () => equipWeapon(i, menu.clickHand), { sub: w.sub, left: true, size: 24 }));
-    wrapText('Picking a weapon puts it in your hand. VR: trigger fires, squeeze and let go to drop or throw. Desktop: left click fires, right click throws, F drops. Swords, bats and hammers also hit with real swings.', 40, 556, 940);
+    wrapText('Picking a weapon puts it in your hand. VR: trigger fires, squeeze and let go to drop or throw. Desktop: left click fires, right click throws, F drops. Draw your own in the Workshop tab.', 40, 556, 940);
   }
   if (P === 'tools') {
     TOOLS.forEach((t, i) => mbtn(32 + (i % 2) * 490, 164 + Math.floor(i / 2) * 82, 470, 72, t.name, () => { setTool(i); }, { active: state.tool === i, key: String((i + 1) % 10), left: true }));
@@ -1979,9 +2331,10 @@ const $ = (id) => document.getElementById(id);
 const bar = $('bar');
 TOOLS.forEach((t, i) => { const d = document.createElement('div'); d.className = 'slot'; d.innerHTML = `<b>${(i + 1) % 10}</b>${t.name}`; bar.appendChild(d); });
 function updateHUD() {
+  bar.hidden = ws.active || renderer.xr.isPresenting;
   [...bar.children].forEach((d, i) => d.classList.toggle('on', i === state.tool));
   const wd = desk.held?.weapon ? desk.held.body.ent.weapon.def : null;
-  $('info').innerHTML = (wd ? `<span class="k">${wd.name.toUpperCase()}</span> · click: ${wd.melee ? 'swing' : wd.grenade ? 'pull pin' : 'fire'} · right click: throw · F: drop<br>` :
+  $('info').innerHTML = ws.active ? '<span class="k">WEAPON WORKSHOP</span> · left drag: draw · right drag: look around · wheel: zoom · Z: undo stroke<br>Follow the steps on the panel' : (wd ? `<span class="k">${wd.name.toUpperCase()}</span> · click: ${wd.melee ? 'swing' : wd.grenade ? 'pull pin' : 'fire'} · right click: throw · F: drop<br>` :
     `<span class="k">${TOOLS[state.tool].name.toUpperCase()}</span>${state.tool === 1 ? ' · ' + ITEMS[state.item].name : ''}<br>`) +
     `${MAPS[state.map].name} · ${GRAVITIES[state.gravity].name} g · ${TIMES[state.time].name}${state.paused ? ' · PAUSED' : ''}`;
 }
@@ -2011,7 +2364,7 @@ function updateLockUI() {
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('mousemove', (e) => {
   mouse.x = (e.clientX / innerWidth) * 2 - 1; mouse.y = -(e.clientY / innerHeight) * 2 + 1;
-  if (locked || midDrag) { desk.yaw -= e.movementX * 0.0022; desk.pitch = clamp(desk.pitch - e.movementY * 0.0022, -1.5, 1.5); }
+  if (locked || midDrag || (ws.active && (e.buttons & 2))) { desk.yaw -= e.movementX * 0.0022; desk.pitch = clamp(desk.pitch - e.movementY * 0.0022, -1.5, 1.5); }
 });
 canvas.addEventListener('mousedown', (e) => {
   if (!started || renderer.xr.isPresenting) return;
@@ -2019,6 +2372,10 @@ canvas.addEventListener('mousedown', (e) => {
   mouse.x = (e.clientX / innerWidth) * 2 - 1; mouse.y = -(e.clientY / innerHeight) * 2 + 1;
   updateDeskRay();
   if (e.button === 1) { midDrag = true; e.preventDefault(); return; }
+  if (ws.active) {
+    if (e.button === 0) { const i = menuHoverDesk(); if (i >= 0) clickMenu(i, desk); else if (!desk.overMenu) wsDown(desk); }
+    return;
+  }
   if (menu.visible) {
     const i = menuHoverDesk();
     if (i >= 0) clickMenu(i);
@@ -2037,6 +2394,7 @@ addEventListener('mouseup', (e) => {
 canvas.addEventListener('wheel', (e) => {
   if (!started) return;
   e.preventDefault();
+  if (ws.active) { ws.orbitDist = clamp(ws.orbitDist * (e.deltaY > 0 ? 1.1 : 0.9), 0.5, 3); return; }
   if (desk.held) { desk.held.dist = clamp(desk.held.dist * (e.deltaY > 0 ? 0.9 : 1.1), 0.6, 60); return; }
   if (menu.visible) return;
   if (state.tool === 1) { state.item = cyc(state.item, ITEMS.length, e.deltaY > 0 ? 1 : -1); toast(ITEMS[state.item].name); }
@@ -2045,6 +2403,11 @@ canvas.addEventListener('wheel', (e) => {
 }, { passive: false });
 addEventListener('keydown', (e) => {
   if (!started) return;
+  if (ws.active) {
+    if (e.code === 'Tab') e.preventDefault();
+    if (e.code === 'KeyZ' && !e.repeat) { wsUndo(); menu.dirty = true; }
+    return;
+  }
   if (e.code === 'Tab' || e.code === 'KeyM') { e.preventDefault(); if (renderer.xr.isPresenting) return; setMenuVisible(!menu.visible); if (!menu.visible) tryLock(); return; }
   if (e.repeat) { keys[e.code] = true; return; }
   keys[e.code] = true;
@@ -2139,6 +2502,7 @@ function blocked(from, dir, dist) {
 function movePlayer(dt) {
   const inVR = renderer.xr.isPresenting;
   camera.getWorldPosition(headPos);
+  if (ws.active && !inVR) return; // the workshop camera orbits the drawing instead
   let mx = 0, mz = 0, speed = 3.2;
   const fwd = V3(); camera.getWorldDirection(fwd); fwd.y = 0;
   if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1);
@@ -2209,8 +2573,8 @@ function pollVRButtons() {
       if (edge(4)) { setTool(cyc(state.tool, TOOLS.length, 1)); h.pulse(0.2, 20); }
       if (edge(5)) { state.item = cyc(state.item, ITEMS.length, 1); if (state.tool !== 1) setTool(1); menu.dirty = true; h.pulse(0.2, 20); }
     } else {
-      if (edge(4) || edge(3)) { setMenuVisible(!menu.visible); h.pulse(0.2, 20); }
-      if (edge(5)) undo();
+      if ((edge(4) || edge(3)) && !ws.active) { setMenuVisible(!menu.visible); h.pulse(0.2, 20); }
+      if (edge(5)) { if (ws.active) { wsUndo(); menu.dirty = true; } else undo(); }
     }
     h.buttons = b;
   }
@@ -2398,6 +2762,7 @@ renderer.setAnimationLoop(() => {
     camera.getWorldPosition(headPos);
   }
   updateHands(dt);
+  wsUpdate(dt);
   updateWeapons(dt);
   updateProjectiles(dt);
   for (const n of npcs.slice()) npcThink(n, dt);
@@ -2420,9 +2785,10 @@ renderer.setAnimationLoop(() => {
 });
 
 // boot
+loadCustom();
 attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, rig };
 </script>
