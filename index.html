@@ -1830,7 +1830,7 @@ const WS_AMMO = ['Bullets', 'Laser', 'Rockets', 'Scatter'];
 const WS_STEPS = ['draw', 'type', 'grip', 'zone'];
 const WS_STEP_NAMES = ['Draw', 'Type', 'Grip', 'Damage'];
 const WS_KEY = 'ragdollLab.customWeapons.v1';
-const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, kind: null, ammo: 0, auto: false, grip: null, muzzle: null, zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false };
+const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, kind: null, ammo: 0, auto: false, grip: null, muzzles: [], zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false };
 const customWeapons = []; // { data, def }
 let customCounter = 0;
 
@@ -1873,11 +1873,15 @@ function customDef(data) {
   const zone = (data.zone || []).map(V);
   const maxR = Math.max(...strokes.map(s => s.r));
   const ammo = data.ammo || 0;
+  // barrels: [{p, d}] in weapon space; older saves had a single `muzzle` pointing forward
+  const barrels = (data.muzzles && data.muzzles.length ? data.muzzles : data.muzzle ? [{ p: data.muzzle, d: [0, 0, -1] }] : [{ p: [0, 0, -0.3], d: [0, 0, -1] }])
+    .map(b => ({ p: V(b.p), d: V(b.d).normalize() }));
+  const nb = barrels.length;
   return {
     name: data.name, custom: true,
-    sub: melee ? 'Your drawing · melee' : `Your drawing · ${WS_AMMO[ammo]}${data.auto ? ' · auto' : ''}`,
+    sub: melee ? 'Your drawing · melee' : `Your drawing · ${nb > 1 ? nb + ' barrels · ' : ''}${WS_AMMO[ammo]}${data.auto ? ' · auto' : ''}`,
     mass: clamp(len * 1.2, 0.6, 9), shapes,
-    muzzle: data.muzzle || [0, 0, -0.3],
+    muzzle: barrels[0].p.toArray(),
     rate: melee ? 0.42 : ammo === 2 ? 1.0 : ammo === 3 ? 0.6 : data.auto ? 0.09 : 0.2,
     recoil: melee ? 0 : ammo === 2 ? 2.5 : ammo === 3 ? 2 : 0.7,
     auto: !melee && !!data.auto, holdPitch: melee ? 0.55 : 0,
@@ -1889,16 +1893,36 @@ function customDef(data) {
         const geo = new THREE.SphereGeometry(maxR * 1.35, 8, 6);
         zone.forEach((p, i) => { if (i % 2 === 0) { const m = new THREE.Mesh(geo, glow); m.position.copy(p); g.add(m); } });
       } else {
-        const ring = new THREE.Mesh(new THREE.TorusGeometry(maxR * 1.8 + 0.006, 0.004, 6, 18), new THREE.MeshStandardMaterial({ color: 0xffb020, emissive: 0xff8a00, emissiveIntensity: 1 }));
-        ring.position.copy(V(data.muzzle)); g.add(ring);
+        const ringGeo = new THREE.TorusGeometry(maxR * 1.8 + 0.006, 0.004, 6, 18);
+        const ringMat = new THREE.MeshStandardMaterial({ color: 0xffb020, emissive: 0xff8a00, emissiveIntensity: 1 });
+        for (const b of barrels) { // ring around each barrel tip, facing the way it fires
+          const ring = new THREE.Mesh(ringGeo, ringMat);
+          ring.position.copy(b.p); ring.quaternion.setFromUnitVectors(V3(0, 0, 1), b.d); g.add(ring);
+        }
       }
     },
     fire(h, e, M, D) {
       if (melee) { h.swingT = SWING_T; SFX.whoosh(); return; }
-      if (ammo === 0) { shoot(h, e, M, D, { dmg: 24, impulse: 12, spread: data.auto ? 0.02 : 0.005 }); SFX.shot(data.auto ? 2 : 0); flashAt(M); }
-      else if (ammo === 1) { shoot(h, e, M, D, { dmg: 30, impulse: 6, spread: 0.002, color: 0xff3b6b, thick: 0.02, life: 0.12 }); SFX.zap(); flashAt(M, 0xff3b6b, 6); }
-      else if (ammo === 2) WEAPONS[3].fire(h, e, M, D);
-      else { for (let i = 0; i < 6; i++) shoot(h, e, M, D, { dmg: 12, impulse: 7, spread: 0.07 }); SFX.shot(1); flashAt(M, 0xffc070, 12); }
+      const H = h.held; if (!H) return;
+      const q = H.tq, pos = H.target, fwdW = V3(0, 0, -1).applyQuaternion(q);
+      let aimPt = null; // desktop: forward-facing barrels converge on the crosshair
+      if (h.kind === 'desk') { const a = castRay(h.origin, h.dir, 200, e); aimPt = a ? a.point : h.origin.clone().addScaledVector(h.dir, 200); }
+      const dmgScale = 1; // every barrel does full damage
+      for (const b of barrels) {
+        const Mb = b.p.clone().applyQuaternion(q).add(pos);
+        let Db = b.d.clone().applyQuaternion(q);
+        if (aimPt && Db.dot(fwdW) > 0.7) { const dd = aimPt.clone().sub(Mb); if (dd.length() > 0.5) Db = dd.normalize(); }
+        if (ammo === 0) shoot(h, e, Mb, Db, { dmg: 24 * dmgScale, impulse: 12, spread: data.auto ? 0.02 : 0.005 });
+        else if (ammo === 1) shoot(h, e, Mb, Db, { dmg: 30 * dmgScale, impulse: 6, spread: 0.002, color: 0xff3b6b, thick: 0.02, life: 0.12 });
+        else if (ammo === 2) fireProjectile({ pos: Mb, vel: Db.clone().multiplyScalar(26), mesh: rocketMesh(), owner: e, trail: true, life: 5,
+          onHit(hit, p) { explode(hit ? hit.point.clone().addScaledVector(p.vel.clone().normalize(), -0.25) : p.pos, 5, 1.1); } });
+        else for (let i = 0; i < 6; i++) shoot(h, e, Mb, Db, { dmg: 12 * dmgScale, impulse: 7, spread: 0.07 });
+      }
+      const M0 = barrels[0].p.clone().applyQuaternion(q).add(pos);
+      if (ammo === 0) { SFX.shot(data.auto ? 2 : 0); flashAt(M0); }
+      else if (ammo === 1) { SFX.zap(); flashAt(M0, 0xff3b6b, 6); }
+      else if (ammo === 2) { SFX.rocket(); flashAt(M0, 0xffa040, 12); }
+      else { SFX.shot(1); flashAt(M0, 0xffc070, 12); }
     },
   };
 }
@@ -1906,7 +1930,7 @@ function customDef(data) {
 function wsStart() {
   if (ws.active) return;
   for (const h of hands) { if (h.held) releaseHold(h); h.pushing = false; h.firing = false; }
-  Object.assign(ws, { active: true, step: 'draw', strokes: [], kind: null, grip: null, muzzle: null, zone: new Set(), msg: '' });
+  Object.assign(ws, { active: true, step: 'draw', strokes: [], kind: null, grip: null, muzzles: [], zone: new Set(), msg: '' });
   const head = V3(), fwd = V3();
   camera.getWorldPosition(head); camera.getWorldDirection(fwd);
   fwd.y = 0; if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
@@ -1970,7 +1994,22 @@ function wsPick(hand) {
   const hit = raycaster.intersectObject(ws.strokeGroup, true)[0];
   return hit ? wsNearest(hit.point, 0.15) : null;
 }
-function wsInvalidate() { ws.grip = null; ws.muzzle = null; ws.zone.clear(); ws.marksDirty = true; menu.dirty = true; }
+function wsInvalidate() { ws.grip = null; ws.muzzles = []; ws.zone.clear(); ws.marksDirty = true; menu.dirty = true; }
+const WS_MAX_BARRELS = 8;
+// firing direction of a barrel: along the drawn line at that tip, pointing out of the drawing
+function wsBarrelDir(m) {
+  const pts = ws.strokes[m.s]?.pts || [m.p], n = pts.length, i = m.i;
+  let t;
+  if (n < 2) t = m.p.clone().sub(ws.grip || V3());
+  else if (i >= n - 2) t = pts[i].clone().sub(pts[Math.max(0, i - 4)]);
+  else if (i <= 1) t = pts[i].clone().sub(pts[Math.min(n - 1, i + 4)]);
+  else {
+    t = pts[Math.min(n - 1, i + 3)].clone().sub(pts[Math.max(0, i - 3)]);
+    if (ws.grip && t.dot(m.p.clone().sub(ws.grip)) < 0) t.negate();
+  }
+  if (t.lengthSq() < 1e-8) t = m.p.clone().sub(ws.grip || V3()).add(V3(0, 0, -1e-3));
+  return t.normalize();
+}
 function wsUndo() {
   if (!ws.active || ws.step !== 'draw') return;
   const s = ws.strokes.pop(); if (!s) return;
@@ -1999,7 +2038,13 @@ function wsDown(hand) {
   } else if (ws.step === 'zone') {
     if (ws.kind === 'ranged') {
       const n = wsPick(hand);
-      if (n) { ws.muzzle = n.p.clone(); ws.msg = ''; SFX.click(); hand.pulse(0.4, 30); ws.marksDirty = true; menu.dirty = true; }
+      if (n) {
+        const near = ws.muzzles.findIndex(m => m.p.distanceTo(n.p) < 0.04);
+        if (near >= 0) { ws.muzzles.splice(near, 1); SFX.pop(); } // clicking a marked tip removes it
+        else if (ws.muzzles.length >= WS_MAX_BARRELS) { ws.msg = `That's the maximum of ${WS_MAX_BARRELS} barrels.`; menu.dirty = true; return; }
+        else { ws.muzzles.push({ p: n.p.clone(), s: n.s, i: n.i }); SFX.click(); }
+        ws.msg = ''; hand.pulse(0.4, 30); ws.marksDirty = true; menu.dirty = true;
+      }
     } else hand.wsPaint = true;
   }
 }
@@ -2014,11 +2059,16 @@ function wsMarkers() {
     const m = new THREE.Mesh(new THREE.SphereGeometry(0.028, 14, 10), new THREE.MeshBasicMaterial({ color: 0x3fd0c9, transparent: true, opacity: 0.85, depthTest: false }));
     m.position.copy(ws.grip); m.renderOrder = 997; ws.markGroup.add(m);
   }
-  if (si === 3 && ws.kind === 'ranged' && ws.muzzle) {
-    const m = new THREE.Mesh(new THREE.ConeGeometry(0.025, 0.07, 12), new THREE.MeshBasicMaterial({ color: 0xffb020, depthTest: false }));
-    m.position.copy(ws.muzzle); m.renderOrder = 997;
-    if (ws.grip) m.quaternion.setFromUnitVectors(V3(0, 1, 0), ws.muzzle.clone().sub(ws.grip).normalize());
-    ws.markGroup.add(m);
+  if (si === 3 && ws.kind === 'ranged') {
+    for (const mz of ws.muzzles) { // cone at each barrel tip, pointing where it will fire
+      const d = wsBarrelDir(mz);
+      const m = new THREE.Mesh(new THREE.ConeGeometry(0.022, 0.07, 12), new THREE.MeshBasicMaterial({ color: 0xffb020, depthTest: false }));
+      m.position.copy(mz.p).addScaledVector(d, 0.04); m.renderOrder = 997;
+      m.quaternion.setFromUnitVectors(V3(0, 1, 0), d);
+      ws.markGroup.add(m);
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([mz.p, mz.p.clone().addScaledVector(d, 0.35)]), new THREE.LineBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.6 }));
+      ws.markGroup.add(line);
+    }
   }
   if (si === 3 && ws.kind === 'melee') {
     const mat = new THREE.MeshBasicMaterial({ color: 0xff3b3b, transparent: true, opacity: 0.7, depthWrite: false });
@@ -2073,8 +2123,12 @@ function wsUpdate(dt) {
 function wsBuildData() {
   const grip = ws.grip;
   const zonePts = [...ws.zone].map(k => { const [s, i] = k.split(':').map(Number); return ws.strokes[s].pts[i]; });
-  let target = ws.kind === 'ranged' ? ws.muzzle : zonePts.reduce((a, p) => a.add(p), V3()).multiplyScalar(1 / zonePts.length);
-  let fwd = target.clone().sub(grip);
+  const barrels = ws.kind === 'ranged' ? ws.muzzles.map(m => ({ p: m.p, d: wsBarrelDir(m) })) : [];
+  let fwd;
+  if (ws.kind === 'ranged') { // hold it so the barrels point forward on average
+    fwd = barrels.reduce((a, b) => a.add(b.d), V3());
+    if (fwd.length() < 0.3 * barrels.length) fwd = barrels[0].p.clone().sub(grip);
+  } else fwd = zonePts.reduce((a, p) => a.add(p), V3()).multiplyScalar(1 / zonePts.length).sub(grip);
   if (fwd.length() < 0.04) {
     let far = grip, fd = 0;
     for (const s of ws.strokes) for (const p of s.pts) { const d = p.distanceTo(grip); if (d > fd) { fd = d; far = p; } }
@@ -2092,11 +2146,12 @@ function wsBuildData() {
   return {
     name: `Custom ${++customCounter}`, kind: ws.kind, ammo: ws.ammo, auto: ws.auto,
     strokes: ws.strokes.map(s => ({ c: s.color, r: s.r, pts: s.pts.map(p => r4(L(p))) })),
-    zone: zonePts.map(p => r4(L(p))), muzzle: ws.muzzle ? r4(L(ws.muzzle)) : null,
+    zone: zonePts.map(p => r4(L(p))),
+    muzzles: barrels.map(b => ({ p: r4(L(b.p)), d: r4(b.d.clone().applyQuaternion(qi)) })),
   };
 }
 function wsFinish(hand) {
-  if (ws.kind === 'ranged' && !ws.muzzle) { ws.msg = 'Mark the barrel tip first.'; return; }
+  if (ws.kind === 'ranged' && !ws.muzzles.length) { ws.msg = 'Mark at least one barrel tip first.'; return; }
   if (ws.kind === 'melee' && !ws.zone.size) { ws.msg = 'Paint the damaging part first.'; return; }
   const data = wsBuildData();
   const def = customDef(data);
@@ -2125,7 +2180,7 @@ function drawWorkshopPage() {
       : 'Hold the left mouse button and drag to draw. Right-drag to look around the drawing, wheel to zoom. Z undoes the last stroke.',
     type: 'Is this a ranged weapon or a melee weapon?',
     grip: vr ? 'Touch your drawing with the controller tip, or point at it, and pull the trigger where your hand holds it.' : 'Click on your drawing where your hand holds it.',
-    zone: ws.kind === 'ranged' ? 'Mark the barrel tip. Shots come out there, aimed away from the grip.'
+    zone: ws.kind === 'ranged' ? `Mark each barrel tip (up to ${WS_MAX_BARRELS}). Each one fires along the line you drew there. Mark a tip again to remove it.`
       : 'Hold the trigger (or left mouse) and paint over the part that does damage, like a blade edge or a hammer head. Only the painted part hurts.',
   }[ws.step];
   wrapText(text, 40, 180, 940);
@@ -2146,8 +2201,11 @@ function drawWorkshopPage() {
   } else if (ws.step === 'grip') {
     mlabel(40, 300, ws.grip ? 'Grip set. Click again to move it.' : 'No grip set yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: ws.grip ? C.accent2 : C.muted });
   } else if (ws.step === 'zone') {
-    if (ws.kind === 'ranged') mlabel(40, 300, ws.muzzle ? 'Barrel tip set.' : 'No barrel tip set yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: ws.muzzle ? C.accent2 : C.muted });
-    else {
+    if (ws.kind === 'ranged') {
+      const n = ws.muzzles.length;
+      mlabel(40, 300, n ? `${n} barrel${n === 1 ? '' : 's'} marked. They all fire together.` : 'No barrel tips marked yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: n ? C.accent2 : C.muted });
+      mbtn(32, 340, 270, 66, 'Clear barrels', () => { ws.muzzles = []; ws.marksDirty = true; }, { size: 24 });
+    } else {
       mlabel(40, 300, ws.zone.size ? `${ws.zone.size} points marked as damaging.` : 'Nothing painted yet.', { font: '600 26px "IBM Plex Sans", sans-serif', color: ws.zone.size ? C.accent2 : C.muted });
       mbtn(32, 340, 270, 66, 'Clear paint', () => { ws.zone.clear(); ws.marksDirty = true; }, { size: 24 });
     }

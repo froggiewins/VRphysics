@@ -15,7 +15,7 @@ The Workshop tab lets you make your own weapon in four steps:
 1. **Draw** it in the air (VR: hold the trigger; desktop: drag with the left mouse, right-drag to look around). Pick colours and thickness, undo strokes with Y or Z.
 2. **Type:** ranged (bullets, laser, rockets or scatter, single shot or full auto) or melee.
 3. **Grip:** mark where your hand holds it.
-4. **Damage:** for ranged, mark the barrel tip where shots come out; for melee, paint the part that hurts. Only the painted part deals damage.
+4. **Damage:** for ranged, mark one or more barrel tips (up to 8). Each barrel fires along the line you drew at that tip, and they all fire together. Mark a tip again to remove it. For melee, paint the part that hurts. Only the painted part deals damage.
 
 Finished weapons are equipped straight away and saved in your browser, listed under "Your weapons".
 
