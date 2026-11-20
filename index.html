@@ -88,7 +88,7 @@ kbd { font: 600 11px var(--display); background: #0b0f14; border: 1px solid var(
           <li><kbd>Trigger</kbd> use tool · <kbd>Grip</kbd> grab &amp; throw</li>
           <li><kbd>Left stick</kbd> walk · <kbd>Right stick</kbd> turn</li>
           <li>Right stick up/down while holding: reel in/out</li>
-          <li><kbd>X</kbd> wrist menu (point with right hand)</li>
+          <li><kbd>X</kbd> menu: point + trigger, or poke the buttons</li>
           <li><kbd>A</kbd> next tool · <kbd>B</kbd> next item · <kbd>Y</kbd> undo</li>
           <li>Weapons: trigger fires · squeeze &amp; let go to drop</li>
           <li>Punch things with your hands</li>
@@ -1822,7 +1822,7 @@ const menu = { visible: false, page: 'tools', buttons: [], hover: -1, dirty: tru
 menu.canvas = document.createElement('canvas'); menu.canvas.width = MW; menu.canvas.height = MH;
 menu.ctx = menu.canvas.getContext('2d');
 menu.tex = new THREE.CanvasTexture(menu.canvas); menu.tex.colorSpace = THREE.SRGBColorSpace; menu.tex.anisotropy = 8;
-menu.mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.64, 0.45), new THREE.MeshBasicMaterial({ map: menu.tex, transparent: true, toneMapped: false, depthTest: false }));
+menu.mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.64, 0.45), new THREE.MeshBasicMaterial({ map: menu.tex, transparent: true, toneMapped: false, depthTest: false, side: THREE.DoubleSide }));
 menu.mesh.renderOrder = 999; menu.mesh.visible = false;
 const C = { bg: '#121821', line: '#2a3646', btn: '#1c2533', hov: '#2b3a4d', fg: '#e8eef5', muted: '#8b9bb0', accent: '#ffb020', accent2: '#3fd0c9' };
 function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
@@ -1944,15 +1944,29 @@ function setMenuVisible(v) {
   if (!renderer.xr.isPresenting) {
     if (v) { document.exitPointerLock?.(); }
     updateHUD();
-  }
+  } else if (v) placeMenuVR();
+}
+// VR: the menu floats in front of you at chest height, facing your head, so either hand can point at or poke it
+function placeMenuVR() {
+  if (menu.mesh.parent !== rig) rig.add(menu.mesh);
+  const head = V3(), fwd = V3();
+  camera.getWorldPosition(head); camera.getWorldDirection(fwd);
+  fwd.y = 0; if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
+  const p = head.clone().addScaledVector(fwd, 0.5); p.y = head.y - 0.28;
+  menu.mesh.scale.setScalar(1);
+  menu.mesh.material.depthTest = true;
+  menu.mesh.position.copy(rig.worldToLocal(p.clone()));
+  menu.mesh.updateMatrixWorld();
+  menu.mesh.lookAt(head);
+  for (const h of vrHands) h.pokeArmed = false;
 }
 function attachMenu() {
   if (renderer.xr.isPresenting) {
-    const L = leftHand();
-    L.grip.add(menu.mesh);
-    menu.mesh.position.set(0, 0.07, -0.1); menu.mesh.rotation.set(-0.75, 0, 0); menu.mesh.scale.setScalar(0.6);
+    rig.add(menu.mesh);
+    if (menu.visible) placeMenuVR();
   } else {
     camera.add(menu.mesh);
+    menu.mesh.material.depthTest = false;
     menu.mesh.position.set(0, 0, -0.72); menu.mesh.rotation.set(0, 0, 0); menu.mesh.scale.setScalar(1);
   }
 }
@@ -2195,7 +2209,7 @@ function pollVRButtons() {
       if (edge(4)) { setTool(cyc(state.tool, TOOLS.length, 1)); h.pulse(0.2, 20); }
       if (edge(5)) { state.item = cyc(state.item, ITEMS.length, 1); if (state.tool !== 1) setTool(1); menu.dirty = true; h.pulse(0.2, 20); }
     } else {
-      if (edge(4)) { setMenuVisible(!menu.visible); h.pulse(0.2, 20); }
+      if (edge(4) || edge(3)) { setMenuVisible(!menu.visible); h.pulse(0.2, 20); }
       if (edge(5)) undo();
     }
     h.buttons = b;
@@ -2218,16 +2232,32 @@ function updateHands(dt) {
     h.body.position.set(_v.x, _v.y, _v.z); h.prev.copy(_v);
   }
   let deskInfo = '';
+  let hoverAny = -1;
+  if (menu.visible) menu.mesh.updateMatrixWorld();
   for (const h of hands) {
     if (!h.active) continue;
-    // menu hover
+    // menu hover: pointing with the ray, or (VR) poking the panel with the controller tip
     h.menuHover = -1;
     let menuDist = Infinity;
-    if (menu.visible && !(inVR && h === leftHand())) {
+    if (menu.visible) {
+      if (h.kind === 'vr') {
+        const tip = menu.mesh.worldToLocal(h.origin.clone().addScaledVector(h.dir, 0.03));
+        const inside = Math.abs(tip.x) <= 0.32 && Math.abs(tip.y) <= 0.225;
+        if (inside && tip.z < 0.1 && tip.z > -0.06) {
+          const idx = menuHitIndex({ x: tip.x / 0.64 + 0.5, y: tip.y / 0.45 + 0.5 });
+          if (idx >= 0) hoverAny = idx;
+          if (tip.z < 0.012 && h.pokeArmed && idx >= 0) { queue.push(() => { if (menu.visible) clickMenu(idx, h); }); h.pulse(0.6, 30); h.pokeArmed = false; }
+        }
+        if (!inside || tip.z > 0.035) h.pokeArmed = true;
+      }
       raycaster.set(h.origin, h.dir);
-      const mh = raycaster.intersectObject(menu.mesh, false)[0];
+      const mh = menu.visible ? raycaster.intersectObject(menu.mesh, false)[0] : null;
       if (mh) { h.menuHover = menuHitIndex(mh.uv); menuDist = mh.distance; h.overMenu = true; } else h.overMenu = false;
-      if (h === rightHand() || h.kind === 'desk') { if (menu.hover !== h.menuHover) { menu.hover = h.menuHover; menu.dirty = true; } }
+      if (h.menuHover >= 0) {
+        if (h.kind === 'vr' && h.menuHover !== h.lastMenuHover) h.pulse(0.15, 10);
+        if (hoverAny < 0 || h === rightHand()) hoverAny = h.menuHover;
+      }
+      h.lastMenuHover = h.menuHover;
     }
     let end = null, tcol = TOOLS[state.tool].color, showLaser = inVR, dotOn = false, start = h.muzzle;
     if (h.held?.weapon) weaponPose(h);
@@ -2281,6 +2311,7 @@ function updateHands(dt) {
     h.dot.visible = dotOn && inVR;
     if (dotOn) { h.dot.position.copy(end); h.dot.material.color.setHex(tcol); }
   }
+  if (menu.visible && menu.hover !== hoverAny) { menu.hover = hoverAny; menu.dirty = true; }
   const hv = $('hover');
   if (hv.textContent !== deskInfo) hv.textContent = deskInfo;
 }

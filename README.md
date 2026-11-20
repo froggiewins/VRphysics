@@ -10,9 +10,10 @@ Twelve weapons live in the Weapons tab of the menu: Pistol, Shotgun, SMG, Rocket
 
 ## Controls
 
-**VR:** trigger = use tool, grip = grab and throw, left stick = walk, right stick = turn (up/down while holding reels the object in or out), X = wrist menu, A = next tool, B = next spawn item, Y = undo.
+**VR:** trigger = use tool, grip = grab and throw, left stick = walk, right stick = turn (up/down while holding reels the object in or out), X (or left stick click) = menu, which floats in front of you: point and pull the trigger, or poke a button with the controller tip, A = next tool, B = next spawn item, Y = undo.
 
 **Desktop:** WASD move, Shift run, Space jump, left click = use tool, right click or E = grab, mouse wheel = push or pull the held object, R = rotate it, 1-0 = tools, Q = next spawn item, Tab = menu, F = drop weapon, Z = undo, T = slow motion, G = zero gravity, P = pause.
 
 Built with three.js and cannon-es, loaded from the jsDelivr CDN. No build step.
+
 
