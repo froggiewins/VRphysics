@@ -227,7 +227,7 @@ const SKIN_NAMES = ['Light', 'Fair', 'Tan', 'Brown', 'Dark', 'Zombie', 'Alien'];
 
 const state = {
   tool: 0, item: 0, time: 0, gravity: 3, paused: false, ai: true, map: 0, snap: true, gore: 2,
-  npc: { shirt: 1, pants: 0, skin: 0, height: 1.8, behavior: 1, health: 1, random: false },
+  npc: { shirt: 1, pants: 0, skin: 0, height: 1.8, behavior: 1, health: 1, random: false, name: '', body: null },
 };
 
 // ====================================================================
@@ -646,7 +646,7 @@ function goreInit(npc, key, body, mesh, P, s) {
   const inner = buildInnards(key, mesh, s, P);
   const half = P.r ? [P.r * s, P.r * s, P.r * s] : P.he.map(v => v * s);
   const minH = Math.min(...half);
-  npc.gore[key] = { holes: [], bruises: [], u, inner, half, sphere: !!P.r, maxR: key === 'head' ? 0.075 * s : key === 'torso' ? 0.13 * s : minH * 1.15 };
+  npc.gore[key] = { holes: [], bruises: [], u, inner, half, sphere: !!P.r, maxR: P.maxR ? P.maxR * s : key === 'head' ? 0.075 * s : key === 'torso' ? 0.13 * s : minH * 1.15 };
 }
 function goreSync(g) {
   for (let i = 0; i < GORE_H; i++) { const h = g.holes[i]; g.u.uHoles.value[i].set(h ? h.x : 0, h ? h.y : 0, h ? h.z : 0, h ? h.r : 0); }
@@ -792,23 +792,138 @@ function npcOptions() {
   const n = state.npc;
   if (n.random) return {
     shirt: SHIRTS[Math.floor(Math.random() * SHIRTS.length)], pants: PANTS[Math.floor(Math.random() * PANTS.length)],
-    skin: SKINS[Math.floor(Math.random() * 5)], height: rand(1.5, 2.0), behavior: n.behavior, health: HEALTHS[n.health],
+    skin: SKINS[Math.floor(Math.random() * 5)], height: rand(1.5, 2.0), behavior: n.behavior, health: HEALTHS[n.health], body: randomBody(),
   };
-  return { shirt: SHIRTS[n.shirt], pants: PANTS[n.pants], skin: SKINS[n.skin], height: n.height, behavior: n.behavior, health: HEALTHS[n.health] };
+  return { shirt: SHIRTS[n.shirt], pants: PANTS[n.pants], skin: SKINS[n.skin], height: n.height, behavior: n.behavior, health: HEALTHS[n.health], body: bodyIsPlain(n.body) ? null : { ...n.body }, name: n.name || '' };
 }
-// Rest pose in metres for a 1.8 m figure (x, y of centre; half extents / radius)
-const NPC_PARTS = {
-  torso: { he: [0.18, 0.28, 0.1], x: 0, y: 1.18, role: 'shirt', mass: 20 },
-  head: { r: 0.12, x: 0, y: 1.595, role: 'skin', mass: 5 },
-  uArmL: { he: [0.05, 0.15, 0.05], x: -0.24, y: 1.29, role: 'shirt', mass: 2 },
-  lArmL: { he: [0.045, 0.15, 0.045], x: -0.24, y: 0.985, role: 'skin', mass: 1.5 },
-  uArmR: { he: [0.05, 0.15, 0.05], x: 0.24, y: 1.29, role: 'shirt', mass: 2 },
-  lArmR: { he: [0.045, 0.15, 0.045], x: 0.24, y: 0.985, role: 'skin', mass: 1.5 },
-  uLegL: { he: [0.07, 0.22, 0.07], x: -0.09, y: 0.672, role: 'pants', mass: 7 },
-  lLegL: { he: [0.06, 0.22, 0.06], x: -0.09, y: 0.225, role: 'pants', mass: 4 },
-  uLegR: { he: [0.07, 0.22, 0.07], x: 0.09, y: 0.672, role: 'pants', mass: 7 },
-  lLegR: { he: [0.06, 0.22, 0.06], x: 0.09, y: 0.225, role: 'pants', mass: 4 },
-};
+// ---- Ragdoll maker: body shape. Every number is a multiplier on the standard 1.8 m figure.
+const BODY_DEF = { tw: 1, th: 1, td: 1, arm: 1, leg: 1, armT: 1, legT: 1, head: 1, headShape: 0, neck: 1, face: 0, hat: 0, hair: 0, shoes: 0, hatCol: 0, hairCol: 0, weight: 1, muscle: 1, joints: 1, speed: 1 };
+const HEAD_SHAPES = ['Round', 'Boxy', 'Tall'];
+const FACES = ['Normal', 'Happy', 'Angry', 'Shocked', 'Sleepy', 'Cyclops', 'Shades', 'Blank'];
+const HATS = ['None', 'Cap', 'Top hat', 'Crown', 'Helmet', 'Viking', 'Party hat', 'Horns', 'Halo'];
+const HAIRS = ['Bald', 'Short', 'Long', 'Mohawk', 'Afro', 'Ponytail'];
+const JOINTS = [['Stiff', 0.5], ['Normal', 1], ['Loose', 1.5], ['Noodle', 2.2]];
+const HAIR_COLS = ['#1b1410', '#4a2e1a', '#8a5a2b', '#d9b56a', '#c94a24', '#e8e8e8', '#3a6fd8', '#e24fa0'];
+const ACC_COLS = ['#1b1b1b', '#e8503a', '#2f7fe0', '#36b37e', '#f2b134', '#8e5bd6', '#ececec', '#6b4f2a', '#ff7eb6'];
+const ACC_NAMES = ['Black', 'Red', 'Blue', 'Green', 'Gold', 'Purple', 'White', 'Brown', 'Pink'];
+const HAIR_NAMES = ['Black', 'Dark brown', 'Brown', 'Blonde', 'Ginger', 'Grey', 'Blue', 'Pink'];
+// Rest pose in metres for a 1.8 m figure (x, y of centre; half extents / radius), joints, and the
+// numbers the walking muscles need, all worked out from the body shape.
+function npcLayout(bIn) {
+  const b = { ...BODY_DEF, ...(bIn || {}) };
+  const TW = 0.18 * b.tw, TH = 0.28 * b.th, TD = 0.1 * b.td;
+  const UL = 0.22 * b.leg, LL = 0.22 * b.leg, ULw = 0.07 * b.legT, LLw = 0.06 * b.legT;
+  const UA = 0.15 * b.arm, LA = 0.15 * b.arm, UAw = 0.05 * b.armT, LAw = 0.045 * b.armT;
+  const HR = 0.12 * b.head, hs = b.headShape || 0;
+  const hd = hs === 1 ? [HR * 0.92, HR, HR * 0.92] : hs === 2 ? [HR * 0.8, HR * 1.3, HR * 0.85] : [HR, HR, HR];
+  const gap = b.neck <= 1 ? 0.005 + 0.01 * b.neck : 0.015 + 0.05 * (b.neck - 1);
+  const hipX = Math.max(0.09 * b.tw, ULw + 0.02), shX = TW + 0.01 + UAw;
+  const lLegY = LL + 0.005, uLegY = 2 * LL + 0.012 + UL, hipY = uLegY + UL + 0.008, torsoY = hipY + TH;
+  const headY = torsoY + TH + gap + hd[1];
+  const uArmY = torsoY + TH - 0.02 - UA, lArmY = uArmY - UA - 0.005 - LA;
+  const vol = (a, c) => a * c * c, wt = b.weight;
+  const parts = {
+    torso: { he: [TW, TH, TD], x: 0, y: torsoY, role: 'shirt', mass: 20 * b.tw * b.th * b.td * wt, ins: [b.tw, b.th, b.td], maxR: 0.13 * Math.min(b.tw, b.th, b.td * 1.5) },
+    head: hs ? { he: hd, x: 0, y: headY, role: 'skin', mass: 5 * b.head ** 3 * wt, ins: [hd[0] / 0.12, hd[1] / 0.12, hd[2] / 0.12], maxR: 0.075 * b.head }
+      : { r: HR, x: 0, y: headY, role: 'skin', mass: 5 * b.head ** 3 * wt, ins: [b.head, b.head, b.head], maxR: 0.075 * b.head },
+  };
+  for (const [side, sx] of [['L', -1], ['R', 1]]) {
+    parts['uArm' + side] = { he: [UAw, UA, UAw], x: sx * shX, y: uArmY, role: 'shirt', mass: 2 * vol(b.arm, b.armT) * wt, ins: [b.armT, 1, b.armT] };
+    parts['lArm' + side] = { he: [LAw, LA, LAw], x: sx * shX, y: lArmY, role: 'skin', mass: 1.5 * vol(b.arm, b.armT) * wt, ins: [b.armT, 1, b.armT] };
+    parts['uLeg' + side] = { he: [ULw, UL, ULw], x: sx * hipX, y: uLegY, role: 'pants', mass: 7 * vol(b.leg, b.legT) * wt, ins: [b.legT, 1, b.legT] };
+    parts['lLeg' + side] = { he: [LLw, LL, LLw], x: sx * hipX, y: lLegY, role: 'pants', mass: 4 * vol(b.leg, b.legT) * wt, ins: [b.legT, 1, b.legT] };
+  }
+  // keep the standard key order (the online code relies on it)
+  const order = ['torso', 'head', 'uArmL', 'lArmL', 'uArmR', 'lArmR', 'uLegL', 'lLegL', 'uLegR', 'lLegR'];
+  const P = {}; for (const k of order) { P[k] = parts[k]; P[k].mass = Math.max(0.3, P[k].mass); }
+  const jm = JOINTS[b.joints]?.[1] ?? 1, A = (a) => Math.min(3.0, a * jm), Tw = (a) => Math.min(2.5, a * jm);
+  const J = [ // [a, b, pivotA, pivotB, axis (1 up / -1 down), angle, twist]
+    ['torso', 'head', [0, TH + gap * 0.67, 0], [0, -(hd[1] + gap * 0.33), 0], 1, A(0.6), Tw(0.7)],
+    ['torso', 'uArmL', [-shX, TH - 0.02, 0], [0, UA, 0], -1, A(1.9), Tw(0.9)],
+    ['torso', 'uArmR', [shX, TH - 0.02, 0], [0, UA, 0], -1, A(1.9), Tw(0.9)],
+    ['uArmL', 'lArmL', [0, -UA, 0], [0, LA + 0.005, 0], -1, A(1.3), Tw(0.3)],
+    ['uArmR', 'lArmR', [0, -UA, 0], [0, LA + 0.005, 0], -1, A(1.3), Tw(0.3)],
+    ['torso', 'uLegL', [-hipX, -TH, 0], [0, UL + 0.008, 0], -1, A(1.0), Tw(0.4)],
+    ['torso', 'uLegR', [hipX, -TH, 0], [0, UL + 0.008, 0], -1, A(1.0), Tw(0.4)],
+    ['uLegL', 'lLegL', [0, -(UL + 0.005), 0], [0, LL + 0.002, 0], -1, A(1.1), Tw(0.2)],
+    ['uLegR', 'lLegR', [0, -(UL + 0.005), 0], [0, LL + 0.002, 0], -1, A(1.1), Tw(0.2)],
+  ];
+  const L = { // muscle targets (multiplied by the overall size when used)
+    hipH: torsoY, headD: headY - torsoY, hipX, hipY: -TH, shX, shY: TH - 0.02, foot: LL + 0.005, knee: 2 * LL + 0.01,
+    stride: 0.3 * b.leg, lift: 0.14 * b.leg, kneeF: 0.06 * b.leg, step: 1.1 * b.leg, armLo: (2 * UA + 0.005 + LA) * 0.97, armHi: UA,
+    musc: b.muscle, speed: b.speed,
+  };
+  return { P, J, L, b, hd, gap, TW, TH, TD, UA, LA, UAw, LAw, UL, LL, ULw, LLw };
+}
+const NPC_PARTS = npcLayout().P, NPC_L0 = npcLayout().L;
+// Face on the front of the head. Returns the eye meshes (they squash shut when the NPC dies).
+function npcFace(head, lay, s, skin) {
+  const [hw, hh, hz] = lay.hd.map(v => v * s), round = !lay.b.headShape, k = lay.b.head * s, f = lay.b.face | 0;
+  const dark = new THREE.MeshBasicMaterial({ color: 0x111111 });
+  const add = (geo, mat, x, y, z, rz = 0) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.rotation.z = rz; head.add(m); return m; };
+  const zAt = (x, y) => round ? Math.sqrt(Math.max(0, hw * hw - x * x - y * y)) : hz; // depth of the head surface
+  const eyes = [], ex = 0.35 * hw, ey = 0.21 * hh, er = 0.02 * k, my = -0.375 * hh;
+  if (f === 5) { // cyclops
+    const r = 0.042 * k, z = zAt(0, ey) - r * 0.3;
+    add(new THREE.SphereGeometry(r, 14, 10), new THREE.MeshStandardMaterial({ color: 0xf4f4f0, roughness: 0.3 }), 0, ey, z);
+    eyes.push(add(new THREE.SphereGeometry(r * 0.45, 10, 8), dark, 0, ey, z + r * 0.72));
+  } else if (f === 6) { // shades
+    const m = new THREE.MeshStandardMaterial({ color: 0x0b0b0b, roughness: 0.15, metalness: 0.6 });
+    for (const x of [-ex, ex]) add(new THREE.BoxGeometry(0.055 * k, 0.032 * k, 0.012 * k), m, x, ey, zAt(x, ey) + 0.002 * k);
+    add(new THREE.BoxGeometry(ex * 2, 0.008 * k, 0.01 * k), m, 0, ey + 0.008 * k, zAt(0, ey) + 0.004 * k);
+  } else if (f !== 7) {
+    const geo = new THREE.SphereGeometry(er * (f === 3 ? 1.5 : 1), 8, 6);
+    if (f === 4) geo.scale(1, 0.3, 1);
+    for (const x of [-ex, ex]) eyes.push(add(geo, dark, x, ey, zAt(x, ey) - er * 0.2));
+    if (f === 2) for (const x of [-ex, ex]) add(new THREE.BoxGeometry(0.045 * k, 0.009 * k, 0.01 * k), dark, x * 0.95, ey + 0.032 * k, zAt(x, ey + 0.03 * k) + 0.001, x < 0 ? -0.45 : 0.45);
+  }
+  if (f === 1) { const sm = add(new THREE.TorusGeometry(0.026 * k, 0.005 * k, 6, 14, Math.PI), dark, 0, my + 0.014 * k, zAt(0, my) - 0.002 * k); sm.rotation.z = Math.PI; }
+  else if (f === 3) { const o = add(new THREE.SphereGeometry(0.018 * k, 10, 8), dark, 0, my - 0.004 * k, zAt(0, my) - 0.003 * k); o.scale.set(1, 1.3, 0.5); }
+  else if (f !== 7) add(new THREE.BoxGeometry(0.05 * k, 0.01 * k, 0.01 * k), dark, 0, my, zAt(0, my) + 0.002 * k);
+  // long neck
+  const gap = lay.gap * s;
+  if (lay.gap > 0.03) {
+    const nr = Math.min(hw * 0.42, 0.05 * s * Math.sqrt(lay.b.tw)), len = hh * 0.5 + gap;
+    const neck = add(new THREE.CylinderGeometry(nr, nr * 1.1, len, 12), new THREE.MeshStandardMaterial({ color: skin, roughness: 0.7 }), 0, -hh * 0.5 - len / 2, 0);
+    neck.castShadow = true;
+  }
+  return eyes;
+}
+// Hats and hair, stuck to the head mesh
+function npcHeadwear(head, lay, s) {
+  const b = lay.b, [hw, hh, hz] = lay.hd.map(v => v * s), round = !b.headShape, k = b.head * s;
+  const std = (c, o = {}) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.6, side: THREE.DoubleSide, ...o });
+  const add = (geo, mat, x = 0, y = 0, z = 0, rx = 0, rz = 0) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.rotation.set(rx, 0, rz); m.castShadow = true; head.add(m); return m; };
+  // a shell over the top of the head, from the crown down to height `down` (-1 bottom … 1 top)
+  const cover = (mat, grow, down, tilt = 0) => round
+    ? add(new THREE.SphereGeometry(hw * grow, 22, 12, 0, Math.PI * 2, 0, Math.acos(down)), mat, 0, 0, 0, tilt)
+    : add(new THREE.BoxGeometry(hw * 2 * grow, hh * (1 - down) + 0.012 * k, hz * 2 * grow), mat, 0, hh * (1 + down) / 2 + 0.006 * k, 0, tilt * 0.4);
+  const hairM = std(HAIR_COLS[b.hairCol] || HAIR_COLS[0], { roughness: 0.9 });
+  if (b.hair === 1 || b.hair === 2 || b.hair === 5) cover(hairM, 1.04, 0.3, -0.35);
+  if (b.hair === 2) add(new THREE.BoxGeometry(hw * 1.9, hh * 1.5, 0.035 * k), hairM, 0, -0.15 * hh, -hz * 0.98 - 0.012 * k);
+  if (b.hair === 3) add(new THREE.BoxGeometry(0.035 * k, hh * 0.6, hz * 1.7), hairM, 0, hh * 0.98, -hz * 0.1);
+  if (b.hair === 4) add(new THREE.SphereGeometry(1.2 * Math.max(hw, hz), 18, 12), hairM, 0, 0.55 * hh, -0.35 * hz);
+  if (b.hair === 5) {
+    add(new THREE.SphereGeometry(0.33 * hw, 10, 8), hairM, 0, 0.3 * hh, -hz * 1.05);
+    add(new THREE.CylinderGeometry(0.16 * hw, 0.08 * hw, hh * 1.1, 8), hairM, 0, -0.4 * hh, -hz * 1.15, 0.25);
+  }
+  const col = ACC_COLS[b.hatCol] || ACC_COLS[0], hatM = std(col), metal = std(col, { metalness: 0.75, roughness: 0.3 });
+  const horns = (m, len) => { for (const sx of [-1, 1]) add(new THREE.ConeGeometry(0.03 * k, len, 10), m, sx * 0.62 * hw, hh * 0.78 + len * 0.35, 0, 0, -sx * 0.7); };
+  switch (b.hat) {
+    case 1: cover(hatM, 1.08, 0.4, -0.1); add(new THREE.BoxGeometry(hw * 1.5, 0.012 * k, hz * 0.9), hatM, 0, hh * 0.45, hz * 1.2, 0.12); break;
+    case 2: add(new THREE.CylinderGeometry(hw * 0.78, hw * 0.78, hh * 1.5, 22), hatM, 0, hh * 1.6); add(new THREE.CylinderGeometry(hw * 1.25, hw * 1.25, 0.014 * k, 26), hatM, 0, hh * 0.88); break;
+    case 3: {
+      const g = b.hatCol === 0 ? std('#d4af37', { metalness: 0.8, roughness: 0.25 }) : metal;
+      add(new THREE.CylinderGeometry(hw * 0.74, hw * 0.7, hh * 0.35, 22, 1, true), g, 0, hh * 0.98);
+      for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; add(new THREE.ConeGeometry(0.022 * k, hh * 0.32, 8), g, Math.sin(a) * hw * 0.72, hh * 1.3, Math.cos(a) * hw * 0.72); }
+      break;
+    }
+    case 4: case 5: cover(metal, 1.1, 0.05); add(new THREE.TorusGeometry(hw * 1.08, 0.012 * k, 6, 28), metal, 0, round ? hw * 0.05 : hh * 0.05, 0, Math.PI / 2); if (b.hat === 5) horns(std('#efe6cf'), hh * 0.75); break;
+    case 6: { const c = add(new THREE.ConeGeometry(hw * 0.5, hh * 1.3, 18), hatM, hw * 0.08, hh * 1.5, 0, 0, -0.15); const pom = new THREE.Mesh(new THREE.SphereGeometry(0.028 * k, 8, 6), std('#ffffff')); pom.position.y = hh * 0.66; c.add(pom); break; }
+    case 7: horns(hatM, hh * 0.6); break;
+    case 8: add(new THREE.TorusGeometry(hw * 0.72, 0.011 * k, 8, 30), new THREE.MeshBasicMaterial({ color: '#ffe27a' }), 0, hh + 0.13 * k, 0, Math.PI / 2).castShadow = false; break;
+  }
+}
 function createNPC(pos, yaw, o) {
   const s = o.height / 1.8;
   const ms = s * s;
@@ -820,8 +935,11 @@ function createNPC(pos, yaw, o) {
     vd: new CANNON.Vec3(), colors: { shirt: o.shirt, pants: o.pants, skin: o.skin }, mass: 0, removed: false, hurtT: 0, think: Math.random() * 2,
     gore: {}, bleed: 0,
   };
-  npc.spec = { p: R3(pos), yaw, o: { shirt: o.shirt, pants: o.pants, skin: o.skin, height: o.height, behavior: o.behavior, health: isFinite(o.health) ? o.health : -1 } };
-  for (const [key, P] of Object.entries(NPC_PARTS)) {
+  const lay = npcLayout(o.body);
+  npc.L = lay.L; npc.body = o.body ? { ...lay.b } : null;
+  if (o.name) npc.name = o.name;
+  npc.spec = { p: R3(pos), yaw, o: { shirt: o.shirt, pants: o.pants, skin: o.skin, height: o.height, behavior: o.behavior, health: isFinite(o.health) ? o.health : -1, ...(o.body ? { body: npc.body } : {}), ...(o.name ? { name: o.name } : {}) } };
+  for (const [key, P] of Object.entries(lay.P)) {
     const wp = V3(P.x * s, P.y * s, 0).applyQuaternion(q).add(pos);
     const body = new CANNON.Body({
       mass: P.mass * ms, material: MAT.def, collisionFilterGroup: G_NPC,
@@ -838,19 +956,16 @@ function createNPC(pos, yaw, o) {
     mesh.userData = { kind: 'npc', ent: npc, body, role: P.role, baseEmissive: 0 };
     mesh.position.copy(wp); mesh.quaternion.copy(q);
     dynGroup.add(mesh);
-    if (key === 'head') {
-      const eyeM = new THREE.MeshBasicMaterial({ color: 0x111111 });
-      for (const ex of [-0.042, 0.042]) { const e = new THREE.Mesh(new THREE.SphereGeometry(0.02 * s, 8, 6), eyeM); e.position.set(ex * s, 0.025 * s, 0.108 * s); mesh.add(e); }
-      const mouth = new THREE.Mesh(new THREE.BoxGeometry(0.05 * s, 0.01 * s, 0.01 * s), eyeM); mouth.position.set(0, -0.045 * s, 0.113 * s); mesh.add(mouth);
-      npc.eyes = mesh.children;
-    }
+    if (key === 'head') { npc.eyes = npcFace(mesh, lay, s, o.skin); npcHeadwear(mesh, lay, s); }
     if (key === 'lLegL' || key === 'lLegR') {
-      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.13 * s, 0.07 * s, 0.22 * s), new THREE.MeshStandardMaterial({ color: 0x1b1b1b, roughness: 0.6 }));
-      shoe.position.set(0, -0.19 * s, 0.04 * s); shoe.castShadow = true; mesh.add(shoe);
+      const t = lay.b.legT, f = lay.b.leg;
+      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.13 * s * t, 0.07 * s * Math.sqrt(t), 0.22 * s * Math.sqrt(t * f)), new THREE.MeshStandardMaterial({ color: ACC_COLS[lay.b.shoes] || 0x1b1b1b, roughness: 0.6 }));
+      shoe.position.set(0, (-lay.LL + 0.035 * Math.sqrt(t) - 0.005) * s, 0.04 * s * Math.sqrt(t * f)); shoe.castShadow = true; mesh.add(shoe);
     }
     body.ent = npc; body.npcPart = key;
     npc.parts[key] = body; npc.meshes[key] = mesh;
     goreInit(npc, key, body, mesh, P, s);
+    if (P.ins) npc.gore[key].inner.scale.set(P.ins[0], key === 'torso' || key === 'head' ? P.ins[1] : 1, P.ins[2]);
     body.addEventListener('collide', (e) => { // bruises from any hard knock, splits from huge ones
       if (e.body.ent === npc || !state.gore || !netMine(npc)) return;
       const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
@@ -868,19 +983,11 @@ function createNPC(pos, yaw, o) {
   }
   const P = npc.parts, S = (x, y, z) => new CANNON.Vec3(x * s, y * s, z * s);
   const DOWN = new CANNON.Vec3(0, -1, 0), UP = new CANNON.Vec3(0, 1, 0);
-  const cone = (a, b, pa, pb, axis, angle, twist) => {
-    const c = new CANNON.ConeTwistConstraint(a, b, { pivotA: pa, pivotB: pb, axisA: axis, axisB: axis, angle, twistAngle: twist, collideConnected: false });
+  for (const [a, b, pa, pb, ax, angle, twist] of lay.J) {
+    const axis = ax > 0 ? UP : DOWN;
+    const c = new CANNON.ConeTwistConstraint(P[a], P[b], { pivotA: S(...pa), pivotB: S(...pb), axisA: axis, axisB: axis, angle, twistAngle: twist, collideConnected: false });
     world.addConstraint(c); npc.constraints.push(c);
-  };
-  cone(P.torso, P.head, S(0, 0.29, 0), S(0, -0.125, 0), UP, 0.6, 0.7);
-  cone(P.torso, P.uArmL, S(-0.24, 0.26, 0), S(0, 0.15, 0), DOWN, 1.9, 0.9);
-  cone(P.torso, P.uArmR, S(0.24, 0.26, 0), S(0, 0.15, 0), DOWN, 1.9, 0.9);
-  cone(P.uArmL, P.lArmL, S(0, -0.15, 0), S(0, 0.155, 0), DOWN, 1.3, 0.3);
-  cone(P.uArmR, P.lArmR, S(0, -0.15, 0), S(0, 0.155, 0), DOWN, 1.3, 0.3);
-  cone(P.torso, P.uLegL, S(-0.09, -0.28, 0), S(0, 0.228, 0), DOWN, 1.0, 0.4);
-  cone(P.torso, P.uLegR, S(0.09, -0.28, 0), S(0, 0.228, 0), DOWN, 1.0, 0.4);
-  cone(P.uLegL, P.lLegL, S(0, -0.225, 0), S(0, 0.222, 0), DOWN, 1.1, 0.2);
-  cone(P.uLegR, P.lLegR, S(0, -0.225, 0), S(0, 0.222, 0), DOWN, 1.1, 0.2);
+  }
 
   const T = P.torso;
   npc.Ix = T.inertia.x * 4; npc.Iy = T.inertia.y * 4; npc.Iz = T.inertia.z * 4;
@@ -986,9 +1093,10 @@ function npcThink(n, dt) {
   }
   if (speed > 0) n.yaw = Math.atan2(dirx, dirz);
   if (n.duel && n.duelFace && !(n.burn > 0)) n.yaw = Math.atan2(dx, dz); // strafing and backing off while facing you
-  n.vd.set(dirx * speed * n.s, 0, dirz * speed * n.s);
+  const sm = n.L ? n.L.speed : 1;
+  n.vd.set(dirx * speed * n.s * sm, 0, dirz * speed * n.s * sm);
   const hs = Math.hypot(T.velocity.x, T.velocity.z);
-  n.phase += dt * hs * (Math.PI * 2) / (1.1 * n.s);
+  n.phase += dt * hs * (Math.PI * 2) / ((n.L ? n.L.step : 1.1) * n.s);
   n.dance = n.duel ? !!n.duelDance : ai && n.behavior === 4;
   n.danceT = (n.danceT || 0) + dt;
 }
@@ -1007,12 +1115,12 @@ function springTo(b, tx, ty, tz, kp, kd, ref, k) {
 }
 function npcControl(n) {
   if (n.state !== 'active' || n.removed) return;
-  const T = n.parts.torso, s = n.s, k = n.strength;
+  const T = n.parts.torso, s = n.s, L = n.L || NPC_L0, k = n.strength * L.musc, ks = n.strength * Math.min(1, 0.55 + 0.45 * L.musc);
   if (T.type !== DYN) return;
   const g = -world.gravity.y;
-  _from.copy(T.position); _to.set(T.position.x, T.position.y - 2.4 * s, T.position.z);
+  _from.copy(T.position); _to.set(T.position.x, T.position.y - 2 * L.hipH * s, T.position.z);
   const hit = world.raycastClosest(_from, _to, { collisionFilterMask: G_WORLD | G_PROP, skipBackfaces: true }, rayRes);
-  let hipH = 1.2 * s;
+  let hipH = L.hipH * s;
   if (n.dance) hipH -= (0.5 + 0.5 * Math.sin(n.danceT * 9)) * 0.08 * s;
   let grounded = false, gy = 0;
   if (hit) {
@@ -1022,7 +1130,7 @@ function npcControl(n) {
       grounded = true;
       let fy = n.mass * (g + 40 * (hipH - d) - 8 * T.velocity.y);
       fy = clamp(fy, 0, n.mass * (g * 2.5 + 16));
-      T.force.y += fy * k;
+      T.force.y += fy * ks;
       T.force.x += n.mass * 4 * (n.vd.x - T.velocity.x) * k;
       T.force.z += n.mass * 4 * (n.vd.z - T.velocity.z) * k;
     }
@@ -1038,32 +1146,32 @@ function npcControl(n) {
   const e = wrapAngle(n.yaw - Math.atan2(_fw.x, _fw.z));
   T.torque.y += n.Iy * (22 * e - 7 * w.y) * k * (_up.y > 0.5 ? 1 : 0.2);
   // head
-  _l.set(0, 0.415 * s, 0); T.pointToWorldFrame(_l, _hd);
+  _l.set(0, L.headD * s, 0); T.pointToWorldFrame(_l, _hd);
   springTo(n.parts.head, _hd.x, _hd.y + (n.dance ? Math.sin(n.danceT * 9) * 0.03 * s : 0), _hd.z, 50, 7, T.velocity, k);
   if (!grounded) return;
   const fx = Math.sin(n.yaw), fz = Math.cos(n.yaw);
   const spd = Math.hypot(T.velocity.x, T.velocity.z);
-  const moving = clamp(spd / (1.2 * s), 0, 1);
-  const stride = 0.3 * s * moving;
+  const moving = clamp(spd / (1.2 * s * L.speed), 0, 1);
+  const stride = L.stride * s * moving;
   for (const side of [-1, 1]) {
-    const L = side < 0 ? 'L' : 'R';
+    const S = side < 0 ? 'L' : 'R';
     const ph = n.phase + (side < 0 ? 0 : Math.PI);
-    _l.set(side * 0.09 * s, -0.28 * s, 0); T.pointToWorldFrame(_l, _hip);
-    const sw = Math.sin(ph) * stride, lift = Math.max(0, Math.cos(ph)) * 0.14 * s * moving;
+    _l.set(side * L.hipX * s, L.hipY * s, 0); T.pointToWorldFrame(_l, _hip);
+    const sw = Math.sin(ph) * stride, lift = Math.max(0, Math.cos(ph)) * L.lift * s * moving;
     const ftx = _hip.x + fx * sw, ftz = _hip.z + fz * sw, fty = gy + 0.02 * s + lift;
-    const kx = ftx + fx * 0.06 * s, ky = fty + 0.45 * s, kz = ftz + fz * 0.06 * s;
-    springTo(n.parts['lLeg' + L], ftx, fty + 0.225 * s, ftz, 60, 9, T.velocity, k);
-    springTo(n.parts['uLeg' + L], (_hip.x + kx) / 2, (_hip.y + ky) / 2, (_hip.z + kz) / 2, 60, 9, T.velocity, k);
-    _l.set(side * 0.24 * s, 0.26 * s, 0); T.pointToWorldFrame(_l, _sh);
+    const kx = ftx + fx * L.kneeF * s, ky = fty + L.knee * s, kz = ftz + fz * L.kneeF * s;
+    springTo(n.parts['lLeg' + S], ftx, fty + L.foot * s, ftz, 60, 9, T.velocity, k);
+    springTo(n.parts['uLeg' + S], (_hip.x + kx) / 2, (_hip.y + ky) / 2, (_hip.z + kz) / 2, 60, 9, T.velocity, k);
+    _l.set(side * L.shX * s, L.shY * s, 0); T.pointToWorldFrame(_l, _sh);
     if (n.duel && side > 0 && !n.dance) duelArm(n, k);
     else if (n.dance) {
       const wave = Math.sin(n.danceT * 6 + side) * 0.12 * s;
-      springTo(n.parts['lArm' + L], _sh.x + fz * wave * side, _sh.y + 0.42 * s, _sh.z - fx * wave * side, 35, 6, T.velocity, k);
-      springTo(n.parts['uArm' + L], _sh.x, _sh.y + 0.14 * s, _sh.z, 35, 6, T.velocity, k);
+      springTo(n.parts['lArm' + S], _sh.x + fz * wave * side, _sh.y + L.armLo * 0.95 * s, _sh.z - fx * wave * side, 35, 6, T.velocity, k);
+      springTo(n.parts['uArm' + S], _sh.x, _sh.y + L.armHi * 0.93 * s, _sh.z, 35, 6, T.velocity, k);
     } else {
       const asw = -Math.sin(ph) * stride * 0.8;
-      springTo(n.parts['lArm' + L], _sh.x + fx * asw, _sh.y - 0.44 * s, _sh.z + fz * asw, 30, 6, T.velocity, k);
-      springTo(n.parts['uArm' + L], _sh.x + fx * asw * 0.35, _sh.y - 0.15 * s, _sh.z + fz * asw * 0.35, 30, 6, T.velocity, k);
+      springTo(n.parts['lArm' + S], _sh.x + fx * asw, _sh.y - L.armLo * s, _sh.z + fz * asw, 30, 6, T.velocity, k);
+      springTo(n.parts['uArm' + S], _sh.x + fx * asw * 0.35, _sh.y - L.armHi * s, _sh.z + fz * asw * 0.35, 30, 6, T.velocity, k);
     }
   }
 }
@@ -3959,11 +4067,12 @@ function drawMenu() {
       g.fillStyle = i === si ? C.accent : i < si ? '#24402f' : C.btn; g.fill();
       mlabel(x + 92, 117, `${i + 1}  ${n}`, { align: 'center', color: i === si ? '#1a1205' : C.fg, font: '700 22px "Chakra Petch", sans-serif' });
     });
-  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 107, 88, 101, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 18 }));
+  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 107, 88, 101, 56, name, () => { menu.page = id; }, { active: menu.page === id || (id === 'npc' && menu.page === 'maker'), size: 18 }));
   const P = ws.active ? 'workshop' : menu.page;
   if (P === 'workshop') drawWorkshopPage();
   if (P === 'duel') drawDuelPage();
   if (P === 'online') drawOnlinePage();
+  if (P === 'maker') drawMakerPage();
   if (P === 'weapons') {
     WEAPONS.forEach((w, i) => mbtn(32 + (i % 3) * 323, 160 + Math.floor(i / 3) * 92, 313, 84, w.name, () => equipWeapon(i, menu.clickHand), { sub: w.sub, left: true, size: 24 }));
     wrapText('Picking a weapon puts it in your hand. VR: trigger fires, squeeze and let go to drop or throw. Desktop: left click fires, right click throws, F drops. Draw your own in the Workshop tab.', 40, 556, 940);
@@ -3985,9 +4094,10 @@ function drawMenu() {
     mbtn(32, 594, 180, 60, 'Spawn NPC', () => { state.item = ITEMS.length - 1; setTool(1); }, { size: 22, active: state.tool === 1 && ITEMS[state.item].npc });
     mbtn(222, 594, 180, 60, 'Styler tool', () => setTool(8), { size: 22, active: state.tool === 8 });
     mbtn(412, 594, 174, 60, n.random ? 'Random: on' : 'Random: off', () => n.random = !n.random, { size: 20, active: n.random });
-    drawFigure(790, 168, n);
-    mbtn(610, 444, 382, 60, 'Knock out all NPCs', () => npcs.forEach(x => ragdoll(x, 3)), { size: 22 });
-    mbtn(610, 514, 382, 60, 'Revive all NPCs', () => npcs.forEach(reviveNPC), { size: 22 });
+    if (n.random) drawFigure(790, 168, n); else drawBodyFigure(610, 164, 382, 266, n);
+    mbtn(610, 444, 382, 60, 'Ragdoll maker', () => { menu.page = 'maker'; }, { size: 24, sub: 'Body shape, face, hats, saved designs' });
+    mbtn(610, 514, 186, 60, 'Knock out all', () => npcs.forEach(x => ragdoll(x, 3)), { size: 19 });
+    mbtn(806, 514, 186, 60, 'Revive all', () => npcs.forEach(reviveNPC), { size: 19 });
     mbtn(610, 594, 382, 60, 'Remove all NPCs', () => clearNPCs(), { size: 22 });
   } else if (P === 'maps') {
     MAPS.forEach((m, i) => mbtn(32, 164 + i * 96, 960, 86, m.name, () => { loadMap(i); }, { active: state.map === i, sub: `${m.sub}  ·  ${GRAVITIES[m.g].g.toFixed(2)} m/s²`, left: true, size: 28 }));
@@ -4016,6 +4126,161 @@ function wrapText(text, x, y, maxW) {
   let line = '', yy = y;
   for (const word of text.split(' ')) { const t = line + word + ' '; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, yy); line = word + ' '; yy += 32; } else line = t; }
   g.fillText(line, x, yy);
+}
+// ====================================================================
+//  Ragdoll maker
+// ====================================================================
+const RAG_KEY = 'ragdollLab.ragdolls';
+const RAG_NAMES = ['Bob', 'Dave', 'Gus', 'Noodle', 'Biff', 'Steve', 'Mo', 'Ziggy', 'Pip', 'Tank', 'Wobbles', 'Lenny', 'Pickles', 'Chad', 'Dot', 'Sprocket'];
+const ri = (n) => Math.floor(Math.random() * n);
+function randomBody() {
+  return { ...BODY_DEF, tw: +rand(0.85, 1.2).toFixed(1), td: +rand(0.8, 1.5).toFixed(1), head: +rand(0.9, 1.15).toFixed(1), face: [0, 0, 1, 2, 3, 4][ri(6)],
+    hat: Math.random() < 0.35 ? 1 + ri(HATS.length - 1) : 0, hair: ri(HAIRS.length), hairCol: ri(HAIR_COLS.length), hatCol: ri(ACC_COLS.length), shoes: ri(ACC_COLS.length) };
+}
+function bodyIsPlain(b) { return !b || Object.keys(BODY_DEF).every(k => (b[k] ?? BODY_DEF[k]) === BODY_DEF[k]); }
+const bodyOf = (n) => (n.body ||= { ...BODY_DEF });
+// Number settings: [key, label, min, max, step]; list settings: [key, label, names]
+const MAKER_TABS = [['shape', 'Shape'], ['head', 'Head'], ['colours', 'Colours'], ['build', 'Build'], ['saved', 'Saved']];
+const MAKER_ROWS = {
+  shape: [['height', 'Size'], ['tw', 'Shoulders', 0.5, 2.2, 0.1], ['th', 'Torso', 0.6, 1.8, 0.1], ['td', 'Belly', 0.5, 2.5, 0.1], ['arm', 'Arms', 0.5, 2.5, 0.1], ['leg', 'Legs', 0.4, 2.0, 0.1]],
+  head: [['head', 'Head size', 0.5, 3.0, 0.1], ['headShape', 'Shape', HEAD_SHAPES], ['neck', 'Neck', 0, 6, 0.5], ['face', 'Face', FACES], ['hat', 'Hat', HATS], ['hair', 'Hair', HAIRS]],
+  colours: [['shirt', 'Shirt'], ['pants', 'Trousers'], ['skin', 'Skin'], ['shoes', 'Shoes', ACC_NAMES, ACC_COLS], ['hatCol', 'Hat', ACC_NAMES, ACC_COLS], ['hairCol', 'Hair', HAIR_NAMES, HAIR_COLS]],
+  build: [['armT', 'Arm thick', 0.5, 2.5, 0.1], ['legT', 'Leg thick', 0.5, 2.5, 0.1], ['weight', 'Weight', 0.3, 3.0, 0.1], ['muscle', 'Muscles', 0.2, 2.5, 0.1], ['joints', 'Joints', JOINTS.map(j => j[0])], ['speed', 'Speed', 0.3, 2.5, 0.1]],
+};
+const STARTERS = [
+  ['Tiny', { height: 0.8 }, { head: 1.4, weight: 0.6, face: 1 }],
+  ['Giant', { height: 2.8 }, { tw: 1.3, td: 1.3, weight: 1.6, muscle: 1.4, speed: 0.7, face: 2, hair: 3, hairCol: 4 }],
+  ['Noodle', {}, { arm: 2.2, leg: 1.6, armT: 0.6, legT: 0.6, tw: 0.7, td: 0.7, joints: 3, muscle: 0.45, neck: 3, face: 4, hair: 4, hairCol: 4 }],
+  ['Brute', { shirt: 6 }, { tw: 1.8, td: 1.6, th: 1.1, armT: 1.9, legT: 1.6, arm: 1.15, head: 0.8, weight: 1.8, muscle: 1.6, face: 2, hair: 3, hairCol: 0 }],
+  ['Bobblehead', {}, { head: 2.6, neck: 0.5, face: 1, hair: 1, hairCol: 3, muscle: 1.2 }],
+  ['Long neck', { shirt: 3 }, { neck: 6, leg: 1.4, face: 3, hat: 6, hatCol: 2 }],
+  ['Robot', { skin: 6, shirt: 5, pants: 1 }, { headShape: 1, hat: 4, hatCol: 6, joints: 0, face: 5, weight: 2, speed: 0.8, shoes: 0 }],
+  ['King', { shirt: 4, pants: 4 }, { td: 1.7, hat: 3, hatCol: 0, hair: 2, hairCol: 5, face: 1, weight: 1.3, speed: 0.8 }],
+];
+let ragSaved = [];
+try { ragSaved = JSON.parse(localStorage.getItem(RAG_KEY) || '[]'); if (!Array.isArray(ragSaved)) ragSaved = []; } catch (e) { ragSaved = []; }
+function saveRagList() { try { localStorage.setItem(RAG_KEY, JSON.stringify(ragSaved)); } catch (e) {} }
+function makerDesign() { const n = state.npc; return { name: n.name || 'Ragdoll', shirt: n.shirt, pants: n.pants, skin: n.skin, height: n.height, behavior: n.behavior, health: n.health, body: { ...bodyOf(n) } }; }
+function makerLoad(d) {
+  const n = state.npc;
+  for (const k of ['shirt', 'pants', 'skin', 'height', 'behavior', 'health']) if (d[k] != null) n[k] = d[k];
+  n.name = d.name || ''; n.body = { ...BODY_DEF, ...(d.body || {}) }; n.random = false;
+}
+function makerSave() {
+  const d = makerDesign(), i = ragSaved.findIndex(x => x.name === d.name);
+  if (i >= 0) ragSaved[i] = d; else ragSaved.push(d);
+  if (ragSaved.length > 30) ragSaved.shift();
+  saveRagList(); toast(`Saved ${d.name}`);
+}
+function makerValue(row, n) {
+  const [key, , a] = row, b = bodyOf(n);
+  if (key === 'height') return `${n.height.toFixed(2)} m`;
+  if (key === 'shirt') return ['Shirt', SHIRTS[n.shirt]];
+  if (key === 'pants') return ['Trousers', PANTS[n.pants]];
+  if (key === 'skin') return [SKIN_NAMES[n.skin], SKINS[n.skin]];
+  if (Array.isArray(a)) return row[3] ? [a[b[key]], row[3][b[key]]] : a[b[key]];
+  if (key === 'neck') return b.neck === 1 ? 'Normal' : b.neck < 1 ? 'Short' : `${(0.015 + 0.05 * (b.neck - 1)).toFixed(2)} m`;
+  return `${Math.round(b[key] * 100)}%`;
+}
+function makerStep(row, n, d) {
+  const [key, , a, max, step] = row, b = bodyOf(n);
+  if (key === 'height') n.height = clamp(+(n.height + d * 0.1).toFixed(2), 0.6, 3.0);
+  else if (key === 'shirt') n.shirt = cyc(n.shirt, SHIRTS.length, d);
+  else if (key === 'pants') n.pants = cyc(n.pants, PANTS.length, d);
+  else if (key === 'skin') n.skin = cyc(n.skin, SKINS.length, d);
+  else if (Array.isArray(a)) b[key] = cyc(b[key], a.length, d);
+  else b[key] = clamp(+(b[key] + d * step).toFixed(2), a, max);
+  n.random = false;
+}
+function drawMakerPage() {
+  const n = state.npc, tab = menu.makerTab || 'shape';
+  bodyOf(n);
+  MAKER_TABS.forEach(([id, name], i) => mbtn(32 + i * 112, 156, 104, 46, name, () => { menu.makerTab = id; }, { active: tab === id, size: 18 }));
+  if (tab === 'saved') {
+    mlabel(40, 241, 'NAME', { font: '700 18px "Chakra Petch", sans-serif' });
+    mbtn(130, 214, 330, 54, n.name || 'Ragdoll', () => {
+      if (renderer.xr.isPresenting) { n.name = RAG_NAMES[ri(RAG_NAMES.length)]; return; }
+      const v = prompt('Ragdoll name', n.name || ''); if (v != null && v.trim()) n.name = v.trim().slice(0, 18);
+    }, { size: 22 });
+    mbtn(468, 214, 118, 54, '🎲', () => { n.name = RAG_NAMES[ri(RAG_NAMES.length)]; }, { size: 22 });
+    mlabel(40, 292, 'STARTERS', { font: '700 18px "Chakra Petch", sans-serif' });
+    STARTERS.forEach(([name, o, b], i) => mbtn(32 + (i % 4) * 139, 308 + Math.floor(i / 4) * 52, 131, 46, name, () => {
+      makerLoad({ ...makerDesign(), shirt: 1, pants: 0, skin: 0, height: 1.8, ...o, name, body: { ...BODY_DEF, ...b } });
+    }, { size: 17 }));
+    const per = 6, pages = Math.max(1, Math.ceil(ragSaved.length / per)), pg = Math.min(menu.ragPage || 0, pages - 1);
+    mlabel(40, 432, ragSaved.length ? `YOUR RAGDOLLS (${ragSaved.length})` : 'YOUR RAGDOLLS', { font: '700 18px "Chakra Petch", sans-serif' });
+    if (pages > 1) mbtn(470, 412, 116, 40, `Page ${pg + 1}/${pages}`, () => { menu.ragPage = (pg + 1) % pages; }, { size: 16 });
+    if (!ragSaved.length) mlabel(40, 474, 'Nothing saved yet. Press Save design.', { color: C.fg });
+    ragSaved.slice(pg * per, pg * per + per).forEach((d, j) => {
+      const x = 32 + (j % 2) * 279, y = 456 + Math.floor(j / 2) * 46;
+      mbtn(x, y, 223, 40, d.name, () => { makerLoad(d); toast(`Loaded ${d.name}`); }, { size: 17, left: true, active: d.name === n.name });
+      mbtn(x + 229, y, 42, 40, '✕', () => { ragSaved.splice(ragSaved.indexOf(d), 1); saveRagList(); }, { size: 16 });
+    });
+  } else {
+    MAKER_ROWS[tab].forEach((row, i) => {
+      const y = 214 + i * 62, v = makerValue(row, n), sw = Array.isArray(v) ? v[1] : undefined;
+      mlabel(40, y + 27, row[1].toUpperCase(), { font: '700 17px "Chakra Petch", sans-serif' });
+      mbtn(170, y, 64, 54, '◀', () => makerStep(row, n, -1));
+      mbtn(242, y, 272, 54, Array.isArray(v) ? v[0] : v, null, { swatch: sw, size: 21 }); menu.buttons[menu.buttons.length - 1].fn = null;
+      mbtn(522, y, 64, 54, '▶', () => makerStep(row, n, 1));
+    });
+  }
+  mbtn(32, 594, 112, 60, 'Back', () => { menu.page = 'npc'; }, { size: 20 });
+  mbtn(152, 594, 196, 60, 'Spawn it', () => { state.item = ITEMS.findIndex(it => it.npc); setTool(1); toast('Aim and pull the trigger (click) to place it'); }, { active: true, size: 22 });
+  mbtn(356, 594, 112, 60, 'Random', () => { n.body = randomBody(); n.shirt = ri(SHIRTS.length); n.pants = ri(PANTS.length); n.skin = ri(SKINS.length); n.random = false; }, { size: 18 });
+  mbtn(476, 594, 110, 60, 'Reset', () => { n.body = { ...BODY_DEF }; n.height = 1.8; n.name = ''; }, { size: 18 });
+  drawBodyFigure(610, 156, 382, 424, n);
+  mbtn(610, 594, 382, 60, 'Save design', () => { if (!n.name) n.name = RAG_NAMES[ri(RAG_NAMES.length)]; makerSave(); }, { size: 22, sub: tab === 'saved' ? 'Same name overwrites' : undefined });
+}
+// Front and side view of the current design, drawn to scale with metre lines
+function drawBodyFigure(x0, y0, w, h, n) {
+  const g = menu.ctx, lay = npcLayout(n.body), s = n.height / 1.8, b = lay.b, P = lay.P, hd = lay.hd;
+  g.fillStyle = '#0d131b'; rr(g, x0, y0, w, h, 12); g.fill(); g.strokeStyle = C.line; g.lineWidth = 2; g.stroke();
+  const top = (P.head.y + hd[1] + (b.hat === 2 ? hd[1] * 1.6 : b.hat === 6 ? hd[1] * 1.3 : b.hat ? hd[1] * 0.5 : 0) + (b.hair === 4 ? hd[1] * 0.6 : 0)) * s;
+  const afro = b.hair === 4 ? 1.2 * Math.max(hd[0], hd[2]) : 0;
+  const fw = Math.max(P.uArmR.x + Math.max(P.uArmR.he[0], P.lArmR.he[0]), hd[0] * 1.25, afro), sw = Math.max(P.torso.he[2], hd[2] * 1.25, 0.15 * Math.sqrt(b.legT * b.leg), afro);
+  const H = Math.max(1.0, top + 0.12), u = Math.min((h - 62) / H, (w - 70) / ((2 * fw + 2 * sw) * s)), base = y0 + h - 16;
+  const x1 = x0 + (w - (2 * fw + 2 * sw) * s * u - 30) / 2;
+  g.strokeStyle = 'rgba(255,255,255,.07)';
+  const stepM = H > 2.4 ? 1 : 0.5;
+  for (let m = stepM; m <= H; m += stepM) { const y = base - m * u; g.beginPath(); g.moveTo(x0 + 10, y); g.lineTo(x0 + w - 10, y); g.stroke(); mlabel(x0 + w - 14, y - 10, `${m} m`, { align: 'right', font: '600 14px "IBM Plex Sans", sans-serif' }); }
+  g.fillStyle = 'rgba(255,255,255,.12)'; g.fillRect(x0 + 10, base, w - 20, 2);
+  const sh = SHIRTS[n.shirt], pa = PANTS[n.pants], sk = SKINS[n.skin], shoe = ACC_COLS[b.shoes], hair = HAIR_COLS[b.hairCol], hat = b.hat === 3 && !b.hatCol ? '#d4af37' : ACC_COLS[b.hatCol];
+  const view = (cx, side) => {
+    const R = (x, y, hw, hh, c) => { g.fillStyle = c; g.fillRect(cx + (x - hw) * s * u, base - (y + hh) * s * u, hw * 2 * s * u, hh * 2 * s * u); };
+    const W = (p) => side ? p.he[2] : p.he[0], X = (p) => side ? 0 : p.x;
+    const hx = 0, hy = P.head.y, hw = side ? hd[2] : hd[0], hh = hd[1];
+    for (const k of ['uLegL', 'lLegL', 'uLegR', 'lLegR']) R(X(P[k]), P[k].y, W(P[k]), P[k].he[1], pa);
+    for (const k of ['lLegL', 'lLegR']) R(X(P[k]) + (side ? 0.04 * Math.sqrt(b.legT * b.leg) : 0), 0.035 * Math.sqrt(b.legT), side ? 0.11 * Math.sqrt(b.legT * b.leg) : 0.065 * b.legT, 0.035 * Math.sqrt(b.legT), shoe);
+    if (lay.gap > 0.03) R(hx, P.head.y - hh - lay.gap / 2, Math.min(hw * 0.42, 0.05 * Math.sqrt(b.tw)), lay.gap / 2 + 0.01, sk);
+    if (b.hair === 2) R(side ? -hd[2] - 0.012 : 0, hy - 0.15 * hh, side ? 0.018 : hd[0] * 0.95, hh * 0.75, hair);
+    if (b.hair === 4) { g.fillStyle = hair; g.beginPath(); g.arc(cx + (side ? -0.35 * hd[2] : 0) * s * u, base - (hy + 0.55 * hh) * s * u, 1.2 * Math.max(hd[0], hd[2]) * s * u, 0, 7); g.fill(); }
+    R(X(P.torso), P.torso.y, W(P.torso), P.torso.he[1], sh);
+    for (const k of side ? ['uArmR', 'lArmR'] : ['uArmL', 'lArmL', 'uArmR', 'lArmR']) R(X(P[k]), P[k].y, W(P[k]), P[k].he[1], k[0] === 'u' ? sh : sk);
+    g.fillStyle = sk;
+    if (!b.headShape) { g.beginPath(); g.arc(cx, base - hy * s * u, hw * s * u, 0, 7); g.fill(); } else R(hx, hy, hw, hh, sk);
+    const dot = (x, y, r) => { g.beginPath(); g.arc(cx + x * s * u, base - y * s * u, Math.max(1.2, r * s * u), 0, 7); g.fill(); };
+    if (b.hair === 1 || b.hair === 2 || b.hair === 5) { g.fillStyle = hair; g.fillRect(cx - hw * 1.04 * s * u, base - (hy + hh * 1.04) * s * u, hw * 2.08 * s * u, hh * 0.72 * s * u); }
+    if (b.hair === 3) R(0, hy + hh * 0.98, side ? hd[2] * 0.85 : 0.018, hh * 0.3, hair);
+    g.fillStyle = '#111';
+    const ey = hy + 0.21 * hh, ex = 0.35 * hd[0], fz = side ? hd[2] * 0.9 : 0;
+    if (b.face === 5) dot(side ? fz : 0, ey, 0.03 * b.head);
+    else if (b.face === 6) { if (!side) R(0, ey, ex + 0.028 * b.head, 0.016 * b.head, '#0b0b0b'); else R(fz, ey, 0.012, 0.016 * b.head, '#0b0b0b'); }
+    else if (b.face !== 7) { g.fillStyle = '#111'; for (const x of side ? [fz] : [-ex, ex]) dot(x, ey, 0.02 * b.head * (b.face === 3 ? 1.5 : 1) * (b.face === 4 ? 0.4 : 1)); }
+    if (b.face !== 7 && !side) R(0, hy - 0.375 * hh, b.face === 3 ? 0.016 * b.head : 0.025 * b.head, b.face === 3 ? 0.02 * b.head : 0.005 * b.head, '#111');
+    const ht = hy + hh;
+    if (b.hat === 1) { R(0, ht - hh * 0.25, hw * 1.08, hh * 0.3, hat); R(side ? hw * 1.05 : 0, ht - hh * 0.5, side ? hw * 0.5 : hw * 0.75, 0.008, hat); }
+    if (b.hat === 2) { R(0, ht + hh * 0.6, hw * 0.78, hh * 0.75, hat); R(0, ht - hh * 0.12, hw * 1.25, 0.008, hat); }
+    if (b.hat === 3) { R(0, ht, hw * 0.74, hh * 0.18, hat); for (let i = -2; i <= 2; i++) { g.fillStyle = hat; g.beginPath(); const bx = cx + i * hw * 0.32 * s * u, by = base - (ht + hh * 0.15) * s * u; g.moveTo(bx - 0.025 * s * u, by); g.lineTo(bx, by - hh * 0.35 * s * u); g.lineTo(bx + 0.025 * s * u, by); g.fill(); } }
+    if (b.hat === 4 || b.hat === 5) R(0, ht - hh * 0.45, hw * 1.1, hh * 0.55, hat);
+    if (b.hat === 5 || b.hat === 7) { g.fillStyle = b.hat === 5 ? '#efe6cf' : hat; for (const sx of side ? [0] : [-1, 1]) { const bx = cx + sx * 0.62 * hw * s * u, by = base - (ht - hh * 0.2) * s * u; g.beginPath(); g.moveTo(bx - 0.03 * s * u, by); g.lineTo(bx + sx * 0.25 * hh * s * u, by - hh * 0.6 * s * u); g.lineTo(bx + 0.03 * s * u, by); g.fill(); } }
+    if (b.hat === 6) { g.fillStyle = hat; g.beginPath(); const by = base - (ht - hh * 0.15) * s * u; g.moveTo(cx - hw * 0.5 * s * u, by); g.lineTo(cx, by - hh * 1.3 * s * u); g.lineTo(cx + hw * 0.5 * s * u, by); g.fill(); }
+    if (b.hat === 8) { g.strokeStyle = '#ffe27a'; g.lineWidth = 3; g.beginPath(); g.ellipse(cx, base - (ht + 0.13 * b.head) * s * u, hw * 0.72 * s * u, Math.max(2, hw * 0.15 * s * u), 0, 0, 7); g.stroke(); }
+  };
+  view(x1 + fw * s * u, false); view(x1 + 2 * fw * s * u + 30 + sw * s * u, true);
+  mlabel(x0 + 14, y0 + 20, (n.name || 'Ragdoll').toUpperCase(), { font: '700 18px "Chakra Petch", sans-serif', color: C.accent2 });
+  const mass = Object.values(P).reduce((a, p) => a + p.mass, 0) * s * s;
+  mlabel(x0 + 14, y0 + 42, `${(top).toFixed(2)} m · ${Math.round(mass)} kg`, { font: '600 15px "IBM Plex Sans", sans-serif' });
 }
 function drawFigure(cx, top, n) {
   const g = menu.ctx, s = n.height / 3.0, H = 260 * s, u = H / 1.8, base = top + 262;
@@ -4406,7 +4671,7 @@ function updateHands(dt) {
       if (hit) {
         end = hit.point; dotOn = true;
         if (h.kind === 'desk') {
-          if (hit.ent?.type === 'npc') { const n = hit.ent; deskInfo = `${n.state === 'dead' ? 'Dead' : BEHAVIORS[n.behavior]} NPC · ${isFinite(n.health) ? Math.ceil(n.health) + '/' + n.maxHealth + ' HP' : 'Unbreakable'}${n.state === 'ragdoll' ? ' · knocked out' : ''}`; }
+          if (hit.ent?.type === 'npc') { const n = hit.ent; deskInfo = `${n.name && n.name !== 'NPC' ? n.name + ' · ' : ''}${n.state === 'dead' ? 'Dead' : BEHAVIORS[n.behavior]} NPC · ${isFinite(n.health) ? Math.ceil(n.health) + '/' + n.maxHealth + ' HP' : 'Unbreakable'}${n.state === 'ragdoll' ? ' · knocked out' : ''}`; }
           else if (hit.ent?.type === 'avatar') deskInfo = `${hit.ent.name}${net.pvp ? ' · ' + Math.ceil(net.peers.get(hit.ent.peer)?.hp ?? 100) + ' HP' : ''}`;
           else if (hit.balloon) deskInfo = 'Balloon';
           else if (hit.ent) deskInfo = `${hit.ent.name}${hit.body?.frozen ? ' · frozen' : ''} · ${Math.round(hit.body?.frozen ? hit.body.origMass : hit.body.mass)} kg`;
@@ -4550,5 +4815,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody };
 </script>
