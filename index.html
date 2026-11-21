@@ -21,20 +21,23 @@
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--fg); font-family: var(--body); }
 #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+#menuDom { position: fixed; z-index: 20; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(94vw, calc(90vh * 1024 / 720), 1500px); height: auto; border-radius: 1.6%; box-shadow: 0 10px 40px rgba(0,0,0,.6); user-select: none; }
+#menuDom.dock { left: 12px; transform: translateY(-50%); width: min(max(44vw, 500px), 60vw, calc(92vh * 1024 / 720)); }
 #cross { position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px; pointer-events: none; }
 #cross::before, #cross::after { content: ""; position: absolute; background: var(--fg); opacity: .85; box-shadow: 0 0 2px #000; }
 #cross::before { left: 8px; top: 0; width: 2px; height: 18px; }
 #cross::after { top: 8px; left: 0; height: 2px; width: 18px; }
 #bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(14px + env(safe-area-inset-bottom, 0px)); display: flex; gap: 4px; pointer-events: none; max-width: calc(100% - 32px); flex-wrap: wrap; justify-content: center; }
-.slot { background: rgba(18, 24, 33, .82); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px 5px; font: 600 12px var(--body); color: var(--muted); min-width: 54px; text-align: center; }
-.slot b { display: block; font: 700 10px var(--display); letter-spacing: .08em; color: var(--muted); opacity: .7; }
+.slot { background: rgba(14, 19, 27, .9); border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px 6px; font: 600 clamp(13px, 1.05vw, 17px) var(--body); color: #c5d0dd; min-width: 64px; text-align: center; }
+.slot b { display: block; font: 700 clamp(11px, .85vw, 14px) var(--display); letter-spacing: .08em; color: var(--muted); opacity: .7; }
 .slot.on { border-color: var(--accent); color: var(--fg); background: rgba(40, 30, 8, .9); }
 .slot.on b { color: var(--accent); opacity: 1; }
-#info { position: fixed; left: max(16px, env(safe-area-inset-left, 0px)); top: calc(14px + env(safe-area-inset-top, 0px)); font: 600 13px var(--body); color: var(--fg); text-shadow: 0 1px 2px #000; pointer-events: none; line-height: 1.5; }
+#info { position: fixed; left: max(14px, env(safe-area-inset-left, 0px)); top: calc(12px + env(safe-area-inset-top, 0px)); font: 600 clamp(14px, 1.15vw, 19px) var(--body); color: var(--fg); text-shadow: 0 1px 2px #000; pointer-events: none; line-height: 1.5; background: rgba(10, 14, 20, .62); padding: 8px 14px; border-radius: 9px; max-width: calc(100vw - 40%); }
 #info .k { color: var(--accent); font-family: var(--display); letter-spacing: .06em; }
-#hover { position: fixed; left: 50%; top: calc(50% + 22px); transform: translateX(-50%); font: 600 12px var(--body); color: var(--fg); text-shadow: 0 1px 2px #000; pointer-events: none; white-space: nowrap; }
-#toast { position: fixed; left: 50%; top: 22%; transform: translateX(-50%); font: 700 18px var(--display); letter-spacing: .06em; color: var(--accent); text-shadow: 0 2px 6px #000; pointer-events: none; transition: opacity .3s; opacity: 0; }
-#resume { position: fixed; right: max(16px, env(safe-area-inset-right, 0px)); top: calc(14px + env(safe-area-inset-top, 0px)); font: 600 12px var(--body); color: var(--muted); pointer-events: none; text-align: right; }
+#hover:empty { display: none; }
+#hover { position: fixed; left: 50%; top: calc(50% + 24px); transform: translateX(-50%); font: 600 clamp(14px, 1.1vw, 18px) var(--body); background: rgba(10, 14, 20, .6); padding: 3px 10px; border-radius: 6px; color: var(--fg); text-shadow: 0 1px 2px #000; pointer-events: none; white-space: nowrap; }
+#toast { position: fixed; left: 50%; top: 22%; transform: translateX(-50%); font: 700 clamp(20px, 1.7vw, 30px) var(--display); letter-spacing: .06em; color: var(--accent); text-shadow: 0 2px 6px #000, 0 0 2px #000; pointer-events: none; transition: opacity .3s; opacity: 0; }
+#resume { position: fixed; right: max(14px, env(safe-area-inset-right, 0px)); top: calc(12px + env(safe-area-inset-top, 0px)); font: 600 clamp(13px, 1vw, 17px) var(--body); color: #c5d0dd; background: rgba(10, 14, 20, .62); padding: 8px 14px; border-radius: 9px; pointer-events: none; text-align: right; }
 #start { position: fixed; inset: 0; display: grid; place-items: center; background: radial-gradient(ellipse at 50% 40%, rgba(11, 15, 20, .55), rgba(11, 15, 20, .92)); padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); overflow-y: auto; }
 .card { width: min(760px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 28px clamp(18px, 4vw, 36px); box-shadow: 0 30px 80px rgba(0, 0, 0, .5); margin-block: 24px; }
 .card h1 { font: 700 clamp(34px, 6vw, 54px)/1 var(--display); margin: 0; letter-spacing: .02em; text-wrap: balance; }
@@ -49,7 +52,7 @@ button.big:focus-visible { outline: 2px solid var(--accent2); outline-offset: 2p
 .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
 .cols h3 { font: 700 12px var(--display); letter-spacing: .14em; color: var(--accent2); margin: 0 0 8px; text-transform: uppercase; }
 .cols ul { list-style: none; padding: 0; margin: 0; font-size: 13px; line-height: 1.75; color: var(--fg); }
-kbd { font: 600 11px var(--display); background: #0b0f14; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; color: var(--accent); }
+kbd { font: 600 0.85em var(--display); background: #0b0f14; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; color: var(--accent); }
 @media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
 </style>
 
@@ -2667,7 +2670,43 @@ function drawWorkshopPage() {
 // ====================================================================
 const MW = 1024, MH = 720;
 const menu = { visible: false, page: 'tools', buttons: [], hover: -1, dirty: true };
-menu.canvas = document.createElement('canvas'); menu.canvas.width = MW; menu.canvas.height = MH;
+const MK = 2; // menu canvas is drawn at 2x so text stays sharp on big PC screens
+menu.canvas = document.createElement('canvas'); menu.canvas.width = MW * MK; menu.canvas.height = MH * MK;
+menu.canvas.id = 'menuDom'; menu.canvas.hidden = true; menu.domHover = -1;
+document.body.appendChild(menu.canvas);
+// PC: the menu is a flat overlay you click directly. VR: the same canvas is a texture on a floating panel.
+function syncMenuDom() {
+  const desktop = !renderer.xr.isPresenting, show = menu.visible && desktop;
+  menu.mesh.visible = menu.visible && !desktop;
+  if (menu.canvas.hidden === show) menu.canvas.hidden = !show;
+  menu.canvas.classList.toggle('dock', ws.active);
+  if (!show) { menu.domHover = -1; return; }
+  if (menu.lastMouse) { // re-check every frame: the buttons change when the page does
+    const i = menuDomIndex(menu.lastMouse);
+    if (i !== menu.domHover) { menu.domHover = i; menu.hover = i; menu.dirty = true; menu.canvas.style.cursor = i >= 0 ? 'pointer' : 'default'; }
+  }
+}
+function menuDomIndex(e) {
+  const r = menu.canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width * MW, y = (e.clientY - r.top) / r.height * MH;
+  return menu.buttons.findIndex(b => b.fn && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
+}
+menu.canvas.addEventListener('mousemove', (e) => {
+  menu.lastMouse = { clientX: e.clientX, clientY: e.clientY };
+  const i = menuDomIndex(e);
+  menu.canvas.style.cursor = i >= 0 ? 'pointer' : 'default';
+  if (i !== menu.domHover) { menu.domHover = i; menu.dirty = true; }
+});
+menu.canvas.addEventListener('mouseleave', () => { menu.lastMouse = null; menu.domHover = -1; menu.dirty = true; });
+menu.canvas.addEventListener('mousedown', (e) => {
+  e.preventDefault(); e.stopPropagation(); initAudio();
+  if (e.button !== 0) return;
+  if (menu.dirty) drawMenu(); // make sure the button list matches what is on screen
+  const i = menuDomIndex(e);
+  if (i >= 0) clickMenu(i, desk);
+});
+menu.canvas.addEventListener('wheel', (e) => e.stopPropagation(), { passive: true });
+menu.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 menu.ctx = menu.canvas.getContext('2d');
 menu.tex = new THREE.CanvasTexture(menu.canvas); menu.tex.colorSpace = THREE.SRGBColorSpace; menu.tex.anisotropy = 8;
 menu.mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.64, 0.45), new THREE.MeshBasicMaterial({ map: menu.tex, transparent: true, toneMapped: false, depthTest: false, side: THREE.DoubleSide }));
@@ -2702,6 +2741,7 @@ function stepper(y, label, value, dec, inc, swatch) {
 const cyc = (v, n, d) => (v + d + n) % n;
 function drawMenu() {
   const g = menu.ctx; menu.buttons = [];
+  g.setTransform(MK, 0, 0, MK, 0, 0);
   g.clearRect(0, 0, MW, MH);
   rr(g, 4, 4, MW - 8, MH - 8, 22); g.fillStyle = 'rgba(18,24,33,0.96)'; g.fill(); g.lineWidth = 3; g.strokeStyle = C.line; g.stroke();
   g.font = '700 40px "Chakra Petch", sans-serif'; g.textAlign = 'left'; g.textBaseline = 'alphabetic';
@@ -2944,6 +2984,7 @@ function updateDeskRay() {
   desk.muzzle.set(0.22, -0.2, -0.4); camera.localToWorld(desk.muzzle);
 }
 function menuHoverDesk() {
+  if (!renderer.xr.isPresenting) { desk.overMenu = false; return -1; } // PC uses the overlay's own mouse events
   raycaster.set(desk.origin, desk.dir);
   const hit = raycaster.intersectObject(menu.mesh, false)[0];
   desk.overMenu = !!hit;
@@ -3109,7 +3150,8 @@ function updateHands(dt) {
     // menu hover: pointing with the ray, or (VR) poking the panel with the controller tip
     h.menuHover = -1;
     let menuDist = Infinity;
-    if (menu.visible) {
+    if (menu.visible && h.kind === 'desk' && !inVR) { h.overMenu = false; if (menu.domHover >= 0) hoverAny = menu.domHover; }
+    else if (menu.visible) {
       if (h.kind === 'vr') {
         const tip = menu.mesh.worldToLocal(h.origin.clone().addScaledVector(h.dir, 0.03));
         const inside = Math.abs(tip.x) <= 0.32 && Math.abs(tip.y) <= 0.225;
@@ -3286,6 +3328,7 @@ renderer.setAnimationLoop(() => {
     a.needsUpdate = true;
   }
   sun.position.set(headPos.x + 18, headPos.y + 36, headPos.z + 14); sun.target.position.set(headPos.x, 0, headPos.z);
+  syncMenuDom();
   if (menu.visible && menu.dirty) drawMenu();
   if (toastT > 0) { toastT -= dt; if (toastT <= 0) $('toast').style.opacity = 0; }
   renderer.render(scene, camera);
@@ -3297,5 +3340,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, rig, woundNPC, hitEnt, gibs, splats, camera };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, rig, woundNPC, hitEnt, gibs, splats, camera };
 </script>
