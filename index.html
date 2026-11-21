@@ -1621,6 +1621,38 @@ function spawnSelected(hand, h) {
 const projectiles = [];
 const stuck = [];
 const SWING_T = 0.32;
+// Swing animations for melee weapons. dur = length relative to a normal swing.
+const SWING_STYLES = [
+  { id: 'slash', name: 'Side slash', dur: 1 },
+  { id: 'back', name: 'Backhand', dur: 1 },
+  { id: 'chop', name: 'Overhead chop', dur: 1.15 },
+  { id: 'upper', name: 'Uppercut', dur: 1 },
+  { id: 'stab', name: 'Stab', dur: 0.85 },
+  { id: 'spin', name: 'Spin', dur: 1.5 },
+  { id: 'flurry', name: 'Flurry (3 hits)', dur: 1.6 },
+  { id: 'combo', name: 'Combo', dur: 1 },
+];
+const SWING_COMBO = ['slash', 'back', 'chop'];
+const swingEase = (p) => p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+// Rotates q (and pushes pos forward for thrusts) for progress p in 0..1 of a swing
+function swingPose(style, p, A, q, pos) {
+  const e = swingEase(p), s = Math.sin(p * Math.PI);
+  let x = 0, y = 0, push = 0;
+  switch (style) {
+    case 'back': x = -1.2 * s; y = -1.3 + 2.6 * e; break;
+    case 'chop': x = 1.5 - 3.0 * e; push = 0.12 * s; break;
+    case 'upper': x = -1.4 + 2.9 * e; push = 0.1 * s; break;
+    case 'stab': { const t = p < 0.35 ? p / 0.35 : 1 - (p - 0.35) / 0.65; x = -0.45 * swingEase(t); push = 0.5 * swingEase(t); break; } // levels the tip as it thrusts
+    case 'spin': y = (1.2 - Math.PI * 2 * e) / A; x = -0.4 * s; break; // always a full turn
+    case 'flurry': {
+      const k = Math.min(2, Math.floor(p * 3)), pp = p * 3 - k, dir = k % 2 ? -1 : 1;
+      x = -0.9 * Math.sin(pp * Math.PI) + (k - 1) * 0.35; y = dir * (1.1 - 2.2 * swingEase(pp)); break;
+    }
+    default: x = -1.2 * s; y = 1.3 - 2.6 * e;
+  }
+  q.multiply(_wq.setFromEuler(_we.set(x * A, y * A, 0, 'YXZ')));
+  if (push) pos.addScaledVector(_w.set(0, 0, -1).applyQuaternion(q), push * A);
+}
 const muzzleLight = new THREE.PointLight(0xffc070, 0, 7, 2);
 fxGroup.add(muzzleLight);
 const zcyl = (r1, r2, h, seg = 14) => new THREE.CylinderGeometry(r1, r2, h, seg).rotateX(Math.PI / 2);
@@ -1745,7 +1777,7 @@ function meleeHit(ent, e) {
   if (!ent.heldBy) return;
   const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
   const now = performance.now();
-  if (now - w.lastHit < 220) return;
+  if (now - w.lastHit < (M.hitGap || 220)) return;
   const other = e.body;
   const c = e.contact;
   const pw = c.bi === ent.body ? c.bi.position.vadd(c.ri) : c.bj.position.vadd(c.rj);
@@ -1992,7 +2024,9 @@ const WEAPONS = [
 function makeWeapon(i, pos, quat) {
   const d = typeof i === 'number' ? WEAPONS[i] : i;
   const g = new THREE.Group(); d.build(g);
-  const shapes = d.shapes.map(s => ({ shape: s.r ? new CANNON.Sphere(s.r) : new CANNON.Box(new CANNON.Vec3(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2)), offset: new CANNON.Vec3(...(s.off || [0, 0, 0])) }));
+  const shapes = d.shapes.map(s => ({
+    shape: s.r ? new CANNON.Sphere(s.r) : s.cyl ? new CANNON.Cylinder(s.cyl[0], s.cyl[1], s.cyl[2], 10) : new CANNON.Box(new CANNON.Vec3(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2)),
+    offset: new CANNON.Vec3(...(s.off || [0, 0, 0])), quat: s.q ? new CANNON.Quaternion(...s.q) : undefined }));
   const ent = makeProp({ shapes, mesh: g, mass: d.mass, pos, quat, kind: 'weapon', name: d.name, sound: d.melee && d.name !== 'Sledgehammer' ? 'wood' : 'metal', angDamping: 0.1 });
   ent.weapon = { def: d, idx: i, cool: 0, fuse: 0, lastHit: 0 };
   if (d.melee) ent.body.addEventListener('collide', (e) => meleeHit(ent, e));
@@ -2039,9 +2073,8 @@ function weaponPose(h) {
     if (d.holdPitch) q.multiply(_wq.setFromEuler(_we.set(d.holdPitch, 0, 0)));
   } else { h.grip.getWorldPosition(pos); q.copy(h.quat); }
   if (h.swingT > 0) {
-    const p = 1 - h.swingT / (d.name === 'Sledgehammer' ? SWING_T * 1.3 : SWING_T);
-    const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-    q.multiply(_wq.setFromEuler(_we.set(-1.2 * Math.sin(p * Math.PI), 1.3 - 2.6 * e, 0, 'YXZ')));
+    const p = clamp(1 - h.swingT / (h.swingDur || SWING_T), 0, 1);
+    swingPose(d.swing ? h.swingStyle : 'slash', p, d.swing ? h.swingAmp || 1 : 1, q, pos);
   }
   if (h.recoil > 0.001) {
     q.multiply(_wq.setFromEuler(_we.set(h.recoil * 0.12, 0, 0, 'XYZ')));
@@ -2070,6 +2103,7 @@ function updateWeapons(dt) {
     if (!h.firing && !h.firePressed) continue; // a quick click still fires once
     if ((d.auto || h.firePressed) && w.cool <= 0 && h.swingT <= 0) {
       d.fire(h, ent, h.wMuzzle.clone(), h.wDir.clone());
+      if (h.swingT > 0) h.swingDur = h.swingT;
       w.cool = d.rate; h.recoil += d.recoil; h.firePressed = false;
       if (d.recoil >= 1) h.pulse(Math.min(1, d.recoil / 3), 50);
       else if (d.auto) h.pulse(0.15, 15);
@@ -2157,15 +2191,18 @@ const WS_TUNE = {
   edge: { name: 'Edge', opts: [['Blunt', 0], ['Sharp', 1]], def: 0, melee: true },
   effect: { name: 'Hit effect', opts: [['None', ''], ['Sets on fire', 'fire'], ['Freezes', 'freeze'], ['Electric shock', 'shock'], ['Explodes', 'boom'], ['Shockwave', 'quake']], def: 0, melee: true },
   weight: { name: 'Weight', opts: MUL(['Feather', 'Light', 'Normal', 'Heavy', 'Massive'], [0.3, 0.6, 1, 1.8, 3.5]), def: 2 },
+  swing: { name: 'Swing', opts: SWING_STYLES.map(s => [s.name, s.id]), def: 0, melee: true },
+  swingSpd: { name: 'Swing speed', opts: MUL(['Slow', 'Normal', 'Fast', 'Very fast'], [1.6, 1, 0.7, 0.48]), def: 1, melee: true },
+  swingSize: { name: 'Swing size', opts: MUL(['Small', 'Normal', 'Big', 'Huge'], [0.6, 1, 1.35, 1.7]), def: 1, melee: true },
 };
 const WS_TUNE_RANGED = ['dmg', 'rate', 'knock', 'spread', 'shots', 'speed', 'blast', 'recoil', 'color', 'weight'];
-const WS_TUNE_MELEE = ['edge', 'effect', 'dmg', 'knock', 'blast', 'weight'];
+const WS_TUNE_MELEE = ['swing', 'swingSpd', 'swingSize', 'edge', 'effect', 'dmg', 'knock', 'blast', 'weight'];
 const WS_NAME_A = ['Doom', 'Mega', 'Tiny', 'Angry', 'Sir', 'Hyper', 'Wobbly', 'Grim', 'Turbo', 'Lucky', 'Rusty', 'Cosmic', 'Noodle', 'Thunder', 'Spicy', 'Silent'];
 const WS_NAME_B = ['Stick', 'Blaster', 'Bonker', 'Cannon', 'Slicer', 'Zapper', 'Thumper', 'Spork', 'Boomer', 'Wand', 'Splatter', 'Gun', 'Cleaver', 'Smasher', 'Popper', 'Fork'];
 const wsRandomName = () => WS_NAME_A[Math.floor(Math.random() * WS_NAME_A.length)] + ' ' + WS_NAME_B[Math.floor(Math.random() * WS_NAME_B.length)];
 const tuneDefaults = () => Object.fromEntries(Object.entries(WS_TUNE).map(([k, t]) => [k, t.def]));
 const tuneVal = (tune, k) => WS_TUNE[k].opts[clamp(tune?.[k] ?? WS_TUNE[k].def, 0, WS_TUNE[k].opts.length - 1)][1];
-const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, kind: null, ammo: 0, auto: false, mode: 0, tune: tuneDefaults(), name: '', grip: null, muzzles: [], zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false };
+const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, tool: 0, preview: null, kind: null, ammo: 0, auto: false, mode: 0, tune: tuneDefaults(), name: '', grip: null, muzzles: [], zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false };
 const launchedBalls = [];
 const customWeapons = []; // { data, def }
 let customCounter = 0;
@@ -2181,6 +2218,92 @@ function strokeMesh(pts, r, color, emissive = 0) {
   for (const p of pts.length > 1 ? [pts[0], pts[pts.length - 1]] : [pts[0]]) { const m = new THREE.Mesh(cap, mat); m.position.copy(p); g.add(m); }
   g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
   return g;
+}
+// ---- Solid shapes (box, ball, tube, cone, ring) for the workshop ----
+// sh = { t, pos: Vector3, q: Quaternion, size: [...] }  box [w,h,d] · sphere [r] · cyl/cone [r, len] (axis = local Y, cone tip +Y) · ring [R, tube] (in local XY)
+const WS_TOOLS = [
+  { id: 'free', name: 'Freehand' }, { id: 'line', name: 'Line' }, { id: 'box', name: 'Box' }, { id: 'sphere', name: 'Ball' },
+  { id: 'cyl', name: 'Tube' }, { id: 'cone', name: 'Cone' }, { id: 'ring', name: 'Ring' },
+];
+function shapeGeo(sh) {
+  const [a, b, c] = sh.size;
+  switch (sh.t) {
+    case 'box': return new THREE.BoxGeometry(a, b, c);
+    case 'sphere': return new THREE.SphereGeometry(a, 22, 16);
+    case 'cyl': return new THREE.CylinderGeometry(a, a, b, 20);
+    case 'cone': return new THREE.ConeGeometry(a, b, 20);
+    default: return new THREE.TorusGeometry(a, b, 10, 36);
+  }
+}
+function shapeMesh(sh, color, emissive = 0) {
+  const g = new THREE.Group();
+  const m = new THREE.Mesh(shapeGeo(sh), new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.2, emissive }));
+  m.position.copy(sh.pos); m.quaternion.copy(sh.q); m.castShadow = true; m.receiveShadow = true;
+  g.add(m); return g;
+}
+// Build a shape from a drag: a = where you pressed, b = where you let go, basis = view axes at the start
+function shapeFromDrag(t, a, b, basis, thickR) {
+  const d = b.clone().sub(a), L = Math.max(d.length(), 0.01);
+  const dirQ = (from) => new THREE.Quaternion().setFromUnitVectors(from, d.length() > 1e-4 ? d.clone().normalize() : V3(0, 1, 0));
+  const rad = thickR * 2.5;
+  switch (t) {
+    case 'box': {
+      const w = Math.max(Math.abs(d.dot(basis.x)), 0.01), h = Math.max(Math.abs(d.dot(basis.y)), 0.01), dep = Math.max(Math.abs(d.dot(basis.z)), thickR * 2.2);
+      return { t, pos: a.clone().lerp(b, 0.5), q: basis.q.clone(), size: [w, h, dep] };
+    }
+    case 'sphere': return { t, pos: a.clone(), q: new THREE.Quaternion(), size: [L] };
+    case 'cyl': return { t, pos: a.clone().lerp(b, 0.5), q: dirQ(V3(0, 1, 0)), size: [rad, L] };
+    case 'cone': return { t, pos: a.clone().lerp(b, 0.5), q: dirQ(V3(0, 1, 0)), size: [rad * 1.6, L] };
+    default: return { t: 'ring', pos: a.clone(), q: new THREE.Quaternion().setFromUnitVectors(V3(0, 0, 1), basis.z), size: [L, thickR * 1.3] };
+  }
+}
+// Points on the shape's surface, used to pick the grip, paint damage and mark barrels. Returns {pts, sp}
+function shapePoints(sh) {
+  const [a, b] = sh.size, out = [];
+  const lin = (ext, sp) => { const n = Math.max(1, Math.round(ext / sp) + 1); return n === 1 ? [0] : Array.from({ length: n }, (_, i) => -ext / 2 + ext * i / (n - 1)); };
+  const circle = (r, sp, f) => { const m = Math.max(r > sp * 0.4 ? 6 : 1, Math.round(Math.PI * 2 * r / sp)); for (let i = 0; i < m; i++) { const th = i / m * Math.PI * 2; f(r * Math.cos(th), r * Math.sin(th)); } };
+  let sp = 0.03;
+  for (let tries = 0; tries < 10; tries++, sp *= 1.3) {
+    out.length = 0;
+    const P = (x, y, z) => out.push(V3(x, y, z));
+    if (sh.t === 'box') {
+      const X = lin(a, sp), Y = lin(b, sp), Z = lin(sh.size[2], sp), e = (A, v) => v === A[0] || v === A[A.length - 1];
+      for (const x of X) for (const y of Y) for (const z of Z) if (e(X, x) || e(Y, y) || e(Z, z)) P(x, y, z);
+    } else if (sh.t === 'sphere') {
+      P(0, 0, 0);
+      const n = Math.max(2, Math.round(Math.PI * a / sp));
+      for (let i = 0; i <= n; i++) { const ph = Math.PI * i / n; circle(a * Math.sin(ph), sp, (x, z) => P(x, a * Math.cos(ph), z)); }
+    } else if (sh.t === 'cyl' || sh.t === 'cone') {
+      for (const y of lin(b, sp)) {
+        const r = sh.t === 'cyl' ? a : a * (0.5 - y / b);
+        P(0, y, 0); if (r > sp * 0.4) circle(r, sp, (x, z) => P(x, y, z));
+      }
+    } else {
+      circle(a, sp, (x, y) => { P(x, y, 0); if (b > sp * 0.4) { const len = Math.hypot(x, y) || 1; for (const s of [-1, 1]) { P(x * (1 + s * b / len), y * (1 + s * b / len), 0); P(x, y, s * b); } } });
+    }
+    if (out.length <= 260) break;
+  }
+  for (const p of out) p.applyQuaternion(sh.q).add(sh.pos);
+  return { pts: out, sp };
+}
+// Physics shapes for a solid, in weapon space
+function shapePhys(sh) {
+  const [a, b] = sh.size, off = sh.pos.toArray(), q = sh.q.toArray();
+  switch (sh.t) {
+    case 'box': return [{ size: sh.size.map(v => Math.max(v, 0.02)), off, q }];
+    case 'sphere': return [{ r: Math.max(a, 0.02), off }];
+    case 'cyl': return [{ cyl: [Math.max(a, 0.015), Math.max(a, 0.015), Math.max(b, 0.02)], off, q }];
+    case 'cone': return [{ cyl: [0.006, Math.max(a, 0.015), Math.max(b, 0.02)], off, q }];
+    default: {
+      const m = clamp(Math.round(Math.PI * 2 * a / Math.max(b * 1.6, 0.02)), 6, 16), out = [];
+      for (let i = 0; i < m; i++) { const th = i / m * Math.PI * 2; out.push({ r: Math.max(b, 0.015), off: V3(a * Math.cos(th), a * Math.sin(th), 0).applyQuaternion(sh.q).add(sh.pos).toArray() }); }
+      return out;
+    }
+  }
+}
+function shapeVolume(sh) {
+  const [a, b, c] = sh.size;
+  return { box: a * b * c, sphere: 4.19 * a ** 3, cyl: Math.PI * a * a * b, cone: Math.PI * a * a * b / 3, ring: 19.7 * a * b * b }[sh.t] || 0;
 }
 function saveCustom() {
   try { localStorage.setItem(WS_KEY, JSON.stringify({ counter: customCounter, list: customWeapons.map(c => c.data) })); } catch (e) {}
@@ -2202,16 +2325,19 @@ function grenadeShellMesh() {
 }
 function customDef(data) {
   const V = (a) => new THREE.Vector3(a[0], a[1], a[2]);
-  const strokes = data.strokes.map(s => ({ c: s.c, r: s.r, pts: s.pts.map(V) }));
-  let shapes = [], len = 0;
+  const strokes = data.strokes.map(s => ({ c: s.c, r: s.r, pts: s.pts.map(V), sh: s.sh ? { t: s.sh.t, pos: V(s.sh.p), q: new THREE.Quaternion().fromArray(s.sh.q), size: s.sh.s } : null }));
+  let shapes = [], solids = [], len = 0;
   for (const s of strokes) {
+    if (s.sh) { solids.push(...shapePhys(s.sh)); len += Math.cbrt(shapeVolume(s.sh)) * 4; continue; }
     const step = Math.max(s.r * 2, 0.035); let acc = step;
     for (let i = 0; i < s.pts.length; i++) {
       if (i > 0) { const d = s.pts[i].distanceTo(s.pts[i - 1]); len += d; acc += d; }
       if (acc >= step || i === s.pts.length - 1) { acc = 0; shapes.push({ r: Math.max(s.r, 0.02), off: s.pts[i].toArray() }); }
     }
   }
-  while (shapes.length > 48) shapes = shapes.filter((_, i) => i % 2 === 0);
+  solids = solids.slice(0, 40);
+  while (shapes.length > Math.max(8, 48 - solids.length)) shapes = shapes.filter((_, i) => i % 2 === 0);
+  shapes = shapes.concat(solids);
   const melee = data.kind === 'melee';
   const zone = (data.zone || []).map(V);
   const maxR = Math.max(...strokes.map(s => s.r));
@@ -2226,10 +2352,12 @@ function customDef(data) {
   const auto = !melee && (alwaysAuto || mode === 2);
   const dm = tv('dmg'), km = tv('knock'), sm = tv('spread'), shots = tv('shots'), spd = tv('speed'), blast = tv('blast'), col = tv('color');
   const effect = tv('effect'), sharp = !!tv('edge');
+  const swingId = tv('swing'), swingSt = SWING_STYLES.find(s => s.id === swingId) || SWING_STYLES[0];
+  const swingDur = SWING_T * swingSt.dur * tv('swingSpd'), swingAmp = tv('swingSize');
   const baseRate = WS_AMMO_RATE[ammo] ?? 0.2;
-  const rate = melee ? 0.42 : (mode === 2 && !alwaysAuto ? baseRate * 0.45 : mode === 1 ? Math.max(0.35, baseRate * 1.5) : baseRate) / tv('rate');
+  const rate = melee ? Math.max(0.18, swingDur * 1.15 + 0.05) : (mode === 2 && !alwaysAuto ? baseRate * 0.45 : mode === 1 ? Math.max(0.35, baseRate * 1.5) : baseRate) / tv('rate');
   const stats = melee
-    ? [sharp ? 'sharp' : 'blunt', effect && WS_TUNE.effect.opts.find(o => o[1] === effect)[0].toLowerCase(), dm !== 1 && `dmg ×${dm}`].filter(Boolean)
+    ? [swingSt.name.replace(/ \(.*\)/, '').toLowerCase(), sharp ? 'sharp' : 'blunt', effect && WS_TUNE.effect.opts.find(o => o[1] === effect)[0].toLowerCase(), dm !== 1 && `dmg ×${dm}`].filter(Boolean)
     : [nb > 1 && `${nb} barrels`, WS_AMMO[ammo] || 'Bullets', !alwaysAuto && mode === 1 && 'burst', auto && !alwaysAuto && 'auto', shots > 1 && `×${shots} shots`, dm !== 1 && `dmg ×${dm}`].filter(Boolean);
   const balls = launchedBalls;
   return {
@@ -2239,9 +2367,10 @@ function customDef(data) {
     muzzle: barrels[0].p.toArray(),
     rate, auto, holdPitch: melee ? 0.55 : 0,
     recoil: (melee ? 0 : ammo === 2 || ammo === 8 ? 2.5 : ammo === 3 ? 2 : ammo === 4 ? 0.05 : 0.7) * tv('recoil') * (shots > 1 ? 1 + shots * 0.15 : 1),
-    melee: melee ? { dmg: 6 * dm, knock: 2 * km, zone, zoneR: maxR * 2 + 0.045, sharp, effect, quake: effect === 'quake', blast } : null,
+    melee: melee ? { dmg: 6 * dm, knock: 2 * km, zone, zoneR: maxR * 2 + 0.045, sharp, effect, quake: effect === 'quake', blast, hitGap: swingId === 'flurry' ? 110 : swingDur < 0.2 ? 150 : 220 } : null,
+    swing: melee ? { style: swingId, dur: swingDur, amp: swingAmp } : null,
     build(g) {
-      for (const s of strokes) g.add(strokeMesh(s.pts, s.r, s.c));
+      for (const s of strokes) g.add(s.sh ? shapeMesh(s.sh, s.c) : strokeMesh(s.pts, s.r, s.c));
       if (melee) {
         const glow = new THREE.MeshStandardMaterial({ color: 0xff4a3a, emissive: 0xff2a10, emissiveIntensity: 0.9, transparent: true, opacity: 0.55, depthWrite: false });
         const geo = new THREE.SphereGeometry(maxR * 1.35, 8, 6);
@@ -2256,7 +2385,13 @@ function customDef(data) {
       }
     },
     fire(h, e, M, D) {
-      if (melee) { h.swingT = SWING_T; SFX.whoosh(); return; }
+      if (melee) {
+        h.comboN = (h.comboN || 0) + 1;
+        h.swingStyle = swingId === 'combo' ? SWING_COMBO[(h.comboN - 1) % 3] : swingId;
+        h.swingAmp = swingAmp; h.swingT = h.swingDur = swingDur; SFX.whoosh();
+        if (swingId === 'flurry') { later(swingDur / 3, () => SFX.whoosh()); later(swingDur * 2 / 3, () => SFX.whoosh()); }
+        return;
+      }
       const volley = () => {
         const H = h.held; if (!H || e.removed || e.heldBy !== h) return;
         const q = H.tq, pos = H.target; if (!q || !pos) return;
@@ -2330,7 +2465,7 @@ function customDef(data) {
 function wsStart() {
   if (ws.active) return;
   for (const h of hands) { if (h.held) releaseHold(h); h.pushing = false; h.firing = false; }
-  Object.assign(ws, { active: true, step: 'draw', strokes: [], kind: null, grip: null, muzzles: [], zone: new Set(), msg: '', tune: tuneDefaults(), name: wsRandomName(), mode: ws.auto ? 2 : ws.mode });
+  Object.assign(ws, { active: true, step: 'draw', strokes: [], preview: null, kind: null, grip: null, muzzles: [], zone: new Set(), msg: '', tune: tuneDefaults(), name: wsRandomName(), mode: ws.auto ? 2 : ws.mode });
   const head = V3(), fwd = V3();
   camera.getWorldPosition(head); camera.getWorldDirection(fwd);
   fwd.y = 0; if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
@@ -2398,6 +2533,21 @@ function wsInvalidate() { ws.grip = null; ws.muzzles = []; ws.zone.clear(); ws.m
 const WS_MAX_BARRELS = 8;
 // firing direction of a barrel: along the drawn line at that tip, pointing out of the drawing
 function wsBarrelDir(m) {
+  const sh = ws.strokes[m.s]?.sh;
+  const away = () => m.p.clone().sub(ws.grip || V3()).add(V3(0, 0, -1e-3)).normalize();
+  if (sh) { // solids fire out of the face you marked; tubes and cones along their length
+    const lp = m.p.clone().sub(sh.pos).applyQuaternion(sh.q.clone().invert());
+    let t;
+    if (sh.t === 'cyl' || sh.t === 'cone') t = V3(0, Math.sign(lp.y) || 1, 0);
+    else if (sh.t === 'box') {
+      const r = [0, 1, 2].map(k => Math.abs(lp.getComponent(k)) / Math.max(sh.size[k] / 2, 1e-4));
+      const k = r.indexOf(Math.max(...r)); t = V3(); t.setComponent(k, Math.sign(lp.getComponent(k)) || 1);
+    } else t = lp.lengthSq() > 1e-6 ? lp.clone() : null;
+    if (!t) return away();
+    t.applyQuaternion(sh.q).normalize();
+    if ((sh.t === 'cyl' || sh.t === 'cone') && Math.abs(lp.y) < sh.size[1] * 0.1 && t.dot(away()) < 0) t.negate(); // marked mid-tube: fire away from the grip
+    return t;
+  }
   const pts = ws.strokes[m.s]?.pts || [m.p], n = pts.length, i = m.i;
   let t;
   if (n < 2) t = m.p.clone().sub(ws.grip || V3());
@@ -2427,12 +2577,20 @@ function wsGo(d) {
     if (ws.step === 'zone' && ws.kind === 'ranged' && !ws.muzzles.length) { ws.msg = 'Mark at least one barrel tip first.'; return; }
     if (ws.step === 'zone' && ws.kind === 'melee' && !ws.zone.size) { ws.msg = 'Paint the damaging part first.'; return; }
   }
-  ws.msg = ''; ws.step = WS_STEPS[clamp(si + d, 0, WS_STEPS.length - 1)]; ws.marksDirty = true;
+  ws.msg = ''; ws.preview = null; ws.step = WS_STEPS[clamp(si + d, 0, WS_STEPS.length - 1)]; ws.marksDirty = true;
 }
 function wsDown(hand) {
   if (ws.step === 'draw') {
     const p = wsTip(hand); if (!p) return;
     hand.wsStroke = { pts: [p], color: WS_COLORS[ws.color], r: WS_THICK[ws.thick].r, mesh: null, dirty: true };
+    const tool = WS_TOOLS[ws.tool].id;
+    if (tool !== 'free') { // shapes: press at one end, drag to size it, let go
+      const q = new THREE.Quaternion();
+      if (renderer.xr.isPresenting) { const f = V3(); camera.getWorldDirection(f); q.setFromEuler(new THREE.Euler(0, Math.atan2(-f.x, -f.z), 0)); }
+      else camera.getWorldQuaternion(q);
+      hand.wsStroke.tool = tool; hand.wsStroke.a = p.clone();
+      hand.wsStroke.basis = { q, x: V3(1, 0, 0).applyQuaternion(q), y: V3(0, 1, 0).applyQuaternion(q), z: V3(0, 0, 1).applyQuaternion(q) };
+    }
     ws.strokes.push(hand.wsStroke); wsInvalidate();
   } else if (ws.step === 'grip') {
     const n = wsPick(hand);
@@ -2450,7 +2608,29 @@ function wsDown(hand) {
     } else hand.wsPaint = true;
   }
 }
+// update a shape stroke while it's being dragged out; final = also build its pick points
+function wsShapeUpdate(s, b, final) {
+  if (s.tool === 'line') {
+    const n = Math.max(1, Math.ceil(s.a.distanceTo(b) / 0.012));
+    s.pts = Array.from({ length: n + 1 }, (_, k) => s.a.clone().lerp(b, k / n));
+  } else {
+    s.sh = shapeFromDrag(s.tool, s.a, b, s.basis, WS_THICK[ws.thick].r);
+    if (final) { const sp = shapePoints(s.sh); s.pts = sp.pts; s.r = Math.max(s.r, sp.sp / 2); }
+    else s.pts = [s.a];
+  }
+  s.b = b.clone(); s.dirty = true;
+}
 function wsUp(hand) {
+  const s = hand.wsStroke;
+  if (s?.tool) {
+    hand.wsStroke = null;
+    const b = s.b || s.a;
+    if (s.a.distanceTo(b) < 0.012) { // just a click: drop it
+      ws.strokes.splice(ws.strokes.indexOf(s), 1); if (s.mesh) disposeMesh(s.mesh);
+      ws.msg = 'Drag to size the shape.'; menu.dirty = true; return;
+    }
+    wsShapeUpdate(s, b, true); SFX.click(); menu.dirty = true;
+  }
   if (hand.wsStroke) { hand.wsStroke.dirty = true; hand.wsStroke = null; menu.dirty = true; }
   hand.wsPaint = false;
 }
@@ -2497,7 +2677,8 @@ function wsUpdate(dt) {
       const t = ws.step === 'draw' && !h.overMenu ? wsTip(h) : null;
       cur.visible = !!t; if (t) { cur.position.copy(t); cur.material.color.set(WS_COLORS[ws.color]); cur.scale.setScalar(WS_THICK[ws.thick].r / 0.012); }
     }
-    if (h.wsStroke) {
+    if (h.wsStroke?.tool) { const p = wsTip(h); if (p && (!h.wsStroke.b || p.distanceTo(h.wsStroke.b) > 0.002)) wsShapeUpdate(h.wsStroke, p, false); }
+    else if (h.wsStroke) {
       const p = wsTip(h), s = h.wsStroke;
       const last = s.pts[s.pts.length - 1];
       if (p && p.distanceTo(last) > (inVR ? 0.008 : 0.01)) {
@@ -2518,11 +2699,29 @@ function wsUpdate(dt) {
   }
   for (const s of ws.strokes) if (s.dirty) {
     if (s.mesh) disposeMesh(s.mesh);
-    s.mesh = strokeMesh(s.pts, s.r, s.color); ws.strokeGroup.add(s.mesh); s.dirty = false;
+    s.mesh = s.sh ? shapeMesh(s.sh, s.color) : strokeMesh(s.pts, s.r, s.color); ws.strokeGroup.add(s.mesh); s.dirty = false;
   }
   if (ws.marksDirty) { ws.marksDirty = false; wsMarkers(); }
+  // swing preview: play the chosen swing on the drawing, around the grip
+  ws.strokeGroup.position.set(0, 0, 0); ws.strokeGroup.quaternion.identity();
+  if (ws.preview != null && ws.grip) {
+    ws.preview += dt;
+    const T = tuneVal(ws.tune, 'swing'), st = SWING_STYLES.find(s => s.id === T) || SWING_STYLES[0];
+    const dur = SWING_T * st.dur * tuneVal(ws.tune, 'swingSpd') * 2.5; // slowed down so you can see it
+    const n = T === 'combo' ? 3 : 1, k = Math.floor(ws.preview / dur);
+    if (k >= n) ws.preview = null;
+    else {
+      const Q = wsFrame().q, q = Q.clone(), pos = ws.grip.clone();
+      swingPose(T === 'combo' ? SWING_COMBO[k % 3] : T, (ws.preview - k * dur) / dur, tuneVal(ws.tune, 'swingSize'), q, pos);
+      const R = q.multiply(Q.clone().invert());
+      ws.strokeGroup.quaternion.copy(R);
+      ws.strokeGroup.position.copy(pos.sub(ws.grip.clone().applyQuaternion(R)));
+    }
+  }
+  ws.markGroup.position.copy(ws.strokeGroup.position); ws.markGroup.quaternion.copy(ws.strokeGroup.quaternion);
 }
-function wsBuildData() {
+// the weapon's frame: origin at the grip, -Z pointing at the barrels (ranged) or the painted part (melee)
+function wsFrame() {
   const grip = ws.grip;
   const zonePts = [...ws.zone].map(k => { const [s, i] = k.split(':').map(Number); return ws.strokes[s].pts[i]; });
   const barrels = ws.kind === 'ranged' ? ws.muzzles.map(m => ({ p: m.p, d: wsBarrelDir(m) })) : [];
@@ -2530,7 +2729,7 @@ function wsBuildData() {
   if (ws.kind === 'ranged') { // hold it so the barrels point forward on average
     fwd = barrels.reduce((a, b) => a.add(b.d), V3());
     if (fwd.length() < 0.3 * barrels.length) fwd = barrels[0].p.clone().sub(grip);
-  } else fwd = zonePts.reduce((a, p) => a.add(p), V3()).multiplyScalar(1 / zonePts.length).sub(grip);
+  } else fwd = zonePts.length ? zonePts.reduce((a, p) => a.add(p), V3()).multiplyScalar(1 / zonePts.length).sub(grip) : V3();
   if (fwd.length() < 0.04) {
     let far = grip, fd = 0;
     for (const s of ws.strokes) for (const p of s.pts) { const d = p.distanceTo(grip); if (d > fd) { fd = d; far = p; } }
@@ -2542,12 +2741,20 @@ function wsBuildData() {
   if (up.lengthSq() < 1e-3) up = V3(0, 0, 1).addScaledVector(fwd, -fwd.z);
   up.normalize();
   const z = fwd.clone().negate(), x = up.clone().cross(z).normalize(), y = z.clone().cross(x);
-  const qi = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z)).invert();
+  const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+  return { q, grip, zonePts, barrels };
+}
+function wsBuildData() {
+  const { q, grip, zonePts, barrels } = wsFrame();
+  const qi = q.clone().invert();
   const L = (p) => p.clone().sub(grip).applyQuaternion(qi);
   const r4 = (v) => [+v.x.toFixed(4), +v.y.toFixed(4), +v.z.toFixed(4)];
+  const q4 = (qq) => qq.toArray().map(v => +v.toFixed(5));
   return {
     name: (++customCounter, ws.name || `Custom ${customCounter}`), kind: ws.kind, ammo: ws.ammo, mode: ws.mode, auto: ws.mode === 2, tune: { ...ws.tune },
-    strokes: ws.strokes.map(s => ({ c: s.color, r: s.r, pts: s.pts.map(p => r4(L(p))) })),
+    strokes: ws.strokes.map(s => s.sh
+      ? { c: s.color, r: +s.r.toFixed(4), pts: [], sh: { t: s.sh.t, p: r4(L(s.sh.pos)), q: q4(qi.clone().multiply(s.sh.q)), s: s.sh.size.map(v => +v.toFixed(4)) } }
+      : { c: s.color, r: s.r, pts: s.pts.map(p => r4(L(p))) }),
     zone: zonePts.map(p => r4(L(p))),
     muzzles: barrels.map(b => ({ p: r4(L(b.p)), d: r4(b.d.clone().applyQuaternion(qi)) })),
   };
@@ -2628,22 +2835,25 @@ function drawWorkshopPage() {
   }
   const si = WS_STEPS.indexOf(ws.step), vr = renderer.xr.isPresenting;
   const text = {
-    draw: vr ? 'Hold the trigger and draw in the air inside the glowing box. Draw the handle too. Y undoes the last stroke.'
-      : 'Hold the left mouse button and drag to draw. Right-drag to look around the drawing, wheel to zoom. Z undoes the last stroke.',
+    draw: vr ? 'Hold the trigger and draw in the air inside the glowing box, or pick a shape and drag it out. Y undoes.'
+      : 'Drag with the left mouse to draw, or pick a shape and drag it out. Right-drag to look around, wheel to zoom. Z undoes.',
     type: 'Is this a ranged weapon or a melee weapon?',
-    tune: 'Tune the stats. You can change them later with ⚙ next to the saved weapon.',
+    tune: ws.kind === 'melee' ? 'Pick how it swings and tune the stats. Change them later with ⚙ next to the saved weapon.' : 'Tune the stats. You can change them later with ⚙ next to the saved weapon.',
     grip: vr ? 'Touch your drawing with the controller tip, or point at it, and pull the trigger where your hand holds it.' : 'Click on your drawing where your hand holds it.',
     zone: ws.kind === 'ranged' ? `Mark each barrel tip (up to ${WS_MAX_BARRELS}). Each one fires along the line you drew there. Mark a tip again to remove it.`
       : 'Hold the trigger (or left mouse) and paint over the part that does damage, like a blade edge or a hammer head. Only the painted part hurts.',
   }[ws.step];
   wrapText(text, 40, 180, 940);
   if (ws.step === 'draw') {
-    stepper(250, 'Colour', 'Colour', () => ws.color = cyc(ws.color, WS_COLORS.length, -1), () => ws.color = cyc(ws.color, WS_COLORS.length, 1), WS_COLORS[ws.color]);
-    stepper(320, 'Thickness', WS_THICK[ws.thick].name, () => ws.thick = Math.max(0, ws.thick - 1), () => ws.thick = Math.min(2, ws.thick + 1));
-    mbtn(32, 404, 270, 66, 'Undo stroke', () => wsUndo(), { size: 24 });
-    mbtn(312, 404, 270, 66, 'Clear all', () => wsClear(), { size: 24 });
-    const pts = ws.strokes.reduce((a, s) => a + s.pts.length, 0);
-    mlabel(40, 500, `${ws.strokes.length} stroke${ws.strokes.length === 1 ? '' : 's'} · ${pts} points`);
+    WS_TOOLS.forEach((t, i) => mbtn(32 + i * 138, 250, 132, 58, t.name, () => { ws.tool = i; ws.msg = ''; }, { active: ws.tool === i, size: 20 }));
+    stepper(322, 'Colour', 'Colour', () => ws.color = cyc(ws.color, WS_COLORS.length, -1), () => ws.color = cyc(ws.color, WS_COLORS.length, 1), WS_COLORS[ws.color]);
+    stepper(392, 'Thickness', WS_THICK[ws.thick].name, () => ws.thick = Math.max(0, ws.thick - 1), () => ws.thick = Math.min(2, ws.thick + 1));
+    mbtn(32, 468, 270, 62, 'Undo', () => wsUndo(), { size: 24 });
+    mbtn(312, 468, 270, 62, 'Clear all', () => wsClear(), { size: 24 });
+    const tip = { free: 'Draw freely.', line: 'Drag from one end to the other for a straight line.', box: 'Drag corner to corner. Thickness sets its depth.', sphere: 'Drag out from the centre to size the ball.',
+      cyl: 'Drag along it. Thickness sets how wide. Great for barrels and handles.', cone: 'Drag from the base to the point.', ring: 'Drag out from the centre to size the ring.' }[WS_TOOLS[ws.tool].id];
+    wrapText(tip, 612, 352, 370);
+    mlabel(612, 500, `${ws.strokes.length} part${ws.strokes.length === 1 ? '' : 's'}`);
   } else if (ws.step === 'type') {
     mbtn(32, 250, 470, 100, 'Ranged', () => ws.kind = 'ranged', { active: ws.kind === 'ranged', sub: 'Shoots from a barrel tip you choose', size: 32 });
     mbtn(522, 250, 470, 100, 'Melee', () => ws.kind = 'melee', { active: ws.kind === 'melee', sub: 'Hurts with the part you paint', size: 32 });
@@ -2668,6 +2878,7 @@ function drawWorkshopPage() {
   if (ws.msg) mlabel(40, 560, ws.msg, { color: C.accent, font: '600 24px "IBM Plex Sans", sans-serif' });
   mbtn(32, 584, 210, 64, si === 0 ? 'Cancel' : 'Back', () => (si === 0 ? wsEnd() : wsGo(-1)), { size: 24 });
   if (si > 0) mbtn(252, 584, 210, 64, 'Cancel', () => wsEnd(), { size: 24 });
+  if (ws.step === 'tune' && ws.kind === 'melee') mbtn(472, 584, 210, 64, '▶ Preview swing', () => { ws.preview = 0; }, { size: 20 });
   const last = si === WS_STEPS.length - 1;
   mbtn(692, 584, 300, 64, last ? 'Finish & equip' : 'Next', () => (last ? wsFinish(menu.clickHand) : wsGo(1)), { active: true, size: 24 });
 }
@@ -3666,5 +3877,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, rig, woundNPC, hitEnt, gibs, splats, camera };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera };
 </script>

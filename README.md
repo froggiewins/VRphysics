@@ -20,11 +20,11 @@ NPCs have a skeleton (skull, spine, ribs, pelvis and limb bones) and organs (bra
 
 The Workshop tab lets you make your own weapon in five steps:
 
-1. **Draw** it in the air (VR: hold the trigger; desktop: drag with the left mouse, right-drag to look around). Pick colours and thickness, undo strokes with Y or Z.
+1. **Draw** it in the air (VR: hold the trigger; desktop: drag with the left mouse, right-drag to look around). Draw freehand, or pick a shape tool (line, box, ball, tube, cone or ring) and drag it out to size. Pick colours and thickness, undo with Y or Z.
 2. **Type:** ranged or melee. Ranged weapons pick an ammo type (bullets, laser, rockets, scatter, flames, lightning, sticky bolts, freeze shot, grenades or bouncy balls) and a fire mode (single shot, burst of 3 or full auto).
 3. **Grip:** mark where your hand holds it.
 4. **Damage:** for ranged, mark one or more barrel tips (up to 8). Each barrel fires along the line you drew at that tip, and they all fire together. Mark a tip again to remove it. For melee, paint the part that hurts. Only the painted part deals damage.
-5. **Tune:** give it a name and set its stats. Ranged: damage, fire rate, knockback, accuracy, shots per barrel, projectile speed, blast size, recoil, shot colour and weight. Melee: blunt or sharp edge, a hit effect (fire, freeze, electric shock, explosion or shockwave), damage, knockback, effect size and weight.
+5. **Tune:** give it a name and set its stats. Ranged: damage, fire rate, knockback, accuracy, shots per barrel, projectile speed, blast size, recoil, shot colour and weight. Melee: the swing animation (side slash, backhand, overhead chop, uppercut, stab, spin, a three-hit flurry or a combo that alternates), swing speed and size (with a preview), blunt or sharp edge, a hit effect (fire, freeze, electric shock, explosion or shockwave), damage, knockback, effect size and weight.
 
 Finished weapons are equipped straight away and saved in your browser, listed under "Your weapons". Press ⚙ next to a saved weapon to change its ammo, fire mode, name and stats later.
 
