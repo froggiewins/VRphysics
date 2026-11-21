@@ -24,6 +24,7 @@ html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); c
 #menuDom { position: fixed; z-index: 20; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(94vw, calc(90vh * 1024 / 720), 1500px); height: auto; border-radius: 1.6%; box-shadow: 0 10px 40px rgba(0,0,0,.6); user-select: none; }
 #menuDom.dock { left: 12px; transform: translateY(-50%); width: min(max(44vw, 500px), 60vw, calc(92vh * 1024 / 720)); }
 #duelHud { position: fixed; z-index: 15; left: 50%; top: calc(76px + env(safe-area-inset-top, 0px)); transform: translateX(-50%); width: min(560px, 70vw); height: auto; pointer-events: none; }
+#netHud { position: fixed; z-index: 15; right: max(14px, env(safe-area-inset-right, 0px)); top: calc(64px + env(safe-area-inset-top, 0px)); width: min(360px, 40vw); height: auto; pointer-events: none; }
 #cross { position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px; pointer-events: none; }
 #cross::before, #cross::after { content: ""; position: absolute; background: var(--fg); opacity: .85; box-shadow: 0 0 2px #000; }
 #cross::before { left: 8px; top: 0; width: 2px; height: 18px; }
@@ -430,7 +431,7 @@ function makeProp({ shapes, mesh, mass, pos, quat, material, kind, damping = 0.0
     const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
     const now = performance.now();
     if (v > 1.4 && now - body.lastSnd > 80) { body.lastSnd = now; SFX.impact(v, body.position, sound); }
-    if (ent.bomb && v > 7.5 && !ent.armed) { ent.armed = true; queue.push(() => detonate(ent)); }
+    if (ent.bomb && v > 7.5 && !ent.armed && netMine(ent)) { ent.armed = true; queue.push(() => detonate(ent)); }
   });
   props.push(ent);
   return ent;
@@ -675,6 +676,7 @@ function woundNPC(npc, key, worldPt, kind, size, o = {}) {
   const body = npc.parts[key];
   const lp = body.pointToLocalFrame(CV(worldPt));
   const p = V3(lp.x, lp.y, lp.z);
+  if (net.on && npc.nid && !net.inBoom && !net.applyingWound && netMine(npc)) netSend({ t: 'wd', id: npc.nid, k: key, p: [+lp.x.toFixed(3), +lp.y.toFixed(3), +lp.z.toFixed(3)], kind, size: +size.toFixed(3), o: { k: o.k, gibs: o.gibs } });
   if (kind === 'hole' && state.gore === 2) {
     const r = Math.min(size, g.maxR);
     let [h, d] = nearest(g.holes, p);
@@ -818,6 +820,7 @@ function createNPC(pos, yaw, o) {
     vd: new CANNON.Vec3(), colors: { shirt: o.shirt, pants: o.pants, skin: o.skin }, mass: 0, removed: false, hurtT: 0, think: Math.random() * 2,
     gore: {}, bleed: 0,
   };
+  npc.spec = { p: R3(pos), yaw, o: { shirt: o.shirt, pants: o.pants, skin: o.skin, height: o.height, behavior: o.behavior, health: isFinite(o.health) ? o.health : -1 } };
   for (const [key, P] of Object.entries(NPC_PARTS)) {
     const wp = V3(P.x * s, P.y * s, 0).applyQuaternion(q).add(pos);
     const body = new CANNON.Body({
@@ -849,7 +852,7 @@ function createNPC(pos, yaw, o) {
     npc.parts[key] = body; npc.meshes[key] = mesh;
     goreInit(npc, key, body, mesh, P, s);
     body.addEventListener('collide', (e) => { // bruises from any hard knock, splits from huge ones
-      if (e.body.ent === npc || !state.gore) return;
+      if (e.body.ent === npc || !state.gore || !netMine(npc)) return;
       const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
       if (v < 3.2) return;
       const now = performance.now();
@@ -882,7 +885,7 @@ function createNPC(pos, yaw, o) {
   const T = P.torso;
   npc.Ix = T.inertia.x * 4; npc.Iy = T.inertia.y * 4; npc.Iz = T.inertia.z * 4;
   const onHit = (e) => {
-    if (e.body.ent === npc) return;
+    if (e.body.ent === npc || !netMine(npc)) return;
     const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
     if (v > 4.5) {
       const now = performance.now();
@@ -896,12 +899,13 @@ function createNPC(pos, yaw, o) {
   return npc;
 }
 function ragdoll(npc, t) {
-  if (npc.removed) return;
+  if (npc.removed || netFwd(npc, 'rag', t) || !netMine(npc)) return;
   if (npc.state !== 'dead') npc.state = 'ragdoll';
   npc.ragTimer = Math.max(npc.ragTimer, t);
   npc.strength = 0;
 }
 function hurtNPC(npc, dmg) {
+  if (netFwd(npc, 'hurt', dmg) || !netMine(npc)) return;
   if (npc.removed || npc.state === 'dead' || !isFinite(npc.health)) return;
   npc.health -= dmg;
   if (performance.now() - npc.hurtT > 400) { npc.hurtT = performance.now(); SFX.hurt(npc.parts.torso.position); }
@@ -912,6 +916,7 @@ function hurtNPC(npc, dmg) {
   }
 }
 function reviveNPC(npc) {
+  if (netFwd(npc, 'revive') || !netMine(npc)) return;
   npc.health = npc.maxHealth; npc.state = 'ragdoll'; npc.ragTimer = 0.3; goreHeal(npc);
   for (const m of Object.values(npc.meshes)) m.material.color.set(npc.colors[m.userData.role]);
   npc.eyes?.forEach(e => e.scale.set(1, 1, 1));
@@ -927,16 +932,17 @@ function restyleNPC(npc) {
 // NPC brain (per frame): sets desired velocity and heading
 function npcThink(n, dt) {
   const T = n.parts.torso;
-  if (!isFinite(T.position.y) || T.position.y < -60) { queue.push(() => removeEnt(n)); return; }
+  if (!isFinite(T.position.y) || T.position.y < -60) { if (netMine(n)) queue.push(() => removeEnt(n)); return; }
   goreThink(n, dt);
   if (n.burn > 0) {
     n.burn -= dt;
-    hurtNPC(n, 12 * dt);
+    if (netMine(n)) hurtNPC(n, 12 * dt);
     const parts = Object.values(n.parts);
     for (let i = 0; i < 2; i++) { const b = parts[Math.floor(Math.random() * parts.length)]; flameParticle(V3(b.position.x + rand(-0.1, 0.1), b.position.y, b.position.z + rand(-0.1, 0.1)), V3(rand(-0.3, 0.3), rand(0.5, 1.5), rand(-0.3, 0.3)), rand(0.3, 0.6), 0.8); }
     const f = n.burn > 0 ? 0.5 + 0.5 * Math.random() : 0;
     for (const [k, m] of Object.entries(n.meshes)) if (!n.parts[k].frozen) m.material.emissive.setRGB(0.55 * f, 0.18 * f, 0);
   }
+  if (!netMine(n)) return; // someone else's NPC: its owner runs its brain
   if (n.state === 'dead') return;
   if (n.state === 'ragdoll') {
     n.ragTimer -= dt;
@@ -1076,8 +1082,9 @@ function detachBody(b) {
 }
 function disposeMesh(m) { m.traverse(o => { if (o.isMesh) { o.geometry.dispose(); if (!o.userData.innard || !Object.values(goreMats).includes(o.material)) o.material.dispose?.(); } }); m.parent?.remove(m); }
 function removeEnt(ent) {
-  if (!ent || ent.removed) return;
+  if (!ent || ent.removed || ent.type === 'avatar') return;
   ent.removed = true;
+  if (ent.nid) { if (net.on && !net.applying) netSend({ t: 'rm', id: ent.nid }); net.ents.delete(ent.nid); }
   if (ent.type === 'npc') {
     for (const c of ent.constraints) world.removeConstraint(c);
     for (const b of Object.values(ent.parts)) detachBody(b);
@@ -1137,11 +1144,11 @@ function addBalloon(body, point) {
   dynGroup.add(mesh); fxGroup.add(line); balloons.push(b);
   return b;
 }
-function popBalloon(b) { SFX.pop(); burst(b.mesh.position, b.mesh.material.color, 10); removeBalloon(b); }
+function popBalloon(b) { if (b.nid && net.on && !net.applying) netSend({ t: 'pop', bid: b.nid }); SFX.pop(); burst(b.mesh.position, b.mesh.material.color, 10); removeBalloon(b); }
 
-function addRope(a, la, b, lb) {
+function addRope(a, la, b, lb, restIn) {
   const pa = a.pointToWorldFrame(la), pb = b.pointToWorldFrame(lb);
-  const rest = Math.max(0.2, pa.distanceTo(pb));
+  const rest = restIn ?? Math.max(0.2, pa.distanceTo(pb));
   const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V3(), V3()]), new THREE.LineBasicMaterial({ color: 0xd8c08a }));
   line.frustumCulled = false;
   fxGroup.add(line);
@@ -1150,6 +1157,8 @@ function addRope(a, la, b, lb) {
 
 // Explosion
 function explode(pos, radius = 5, power = 1, o = {}) {
+  const wasBoom = net.inBoom; net.inBoom = true;
+  if (net.on && !net.applying) netSend({ t: 'boom', p: R3(pos), r: radius, pw: power, o: { dust: o.dust, dmg: o.dmg } });
   if (o.dust) { SFX.thud(pos); dustFX(pos, radius); }
   else { SFX.boom(pos); boomFX(pos, radius); }
   for (const h of hands) h.pulse(1, 120);
@@ -1169,8 +1178,8 @@ function explode(pos, radius = 5, power = 1, o = {}) {
     if (e.heldBy && o.dust) continue;
     kick(e.body, 1);
     if (o.dust) continue;
-    if (e.bomb && !e.armed && e.body.position.distanceTo(p) < radius * 0.8) { e.armed = true; later(0.12 + Math.random() * 0.1, () => detonate(e)); }
-    if (e.weapon && e.weapon.def.name === 'Grenade' && !(e.weapon.fuse > 0) && e.body.position.distanceTo(p) < radius * 0.8) e.weapon.fuse = 0.15 + Math.random() * 0.1;
+    if (e.bomb && !e.armed && netMine(e) && e.body.position.distanceTo(p) < radius * 0.8) { e.armed = true; later(0.12 + Math.random() * 0.1, () => detonate(e)); }
+    if (e.weapon && netMine(e) && e.weapon.def.name === 'Grenade' && !(e.weapon.fuse > 0) && e.body.position.distanceTo(p) < radius * 0.8) e.weapon.fuse = 0.15 + Math.random() * 0.1;
   }
   for (const n of npcs) {
     let maxF = 0;
@@ -1187,6 +1196,8 @@ function explode(pos, radius = 5, power = 1, o = {}) {
   }
   for (const b of balloons.slice()) if (b.mesh.position.distanceTo(pos) < radius * 0.7) popBalloon(b);
   duelBlast(pos, radius, o);
+  netBlast(pos, radius, o);
+  net.inBoom = wasBoom;
 }
 function dustFX(pos, r) {
   const m = new THREE.Mesh(new THREE.RingGeometry(0.7, 1, 40), new THREE.MeshBasicMaterial({ color: 0xb8a990, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
@@ -1387,6 +1398,15 @@ const MAPS = [
 ];
 
 function loadMap(i) {
+  if (net.on && net.decided && !net.applying) {
+    if (!net.host) { netSend({ t: 'mapreq', i }); toast(`Asking the host to load ${MAPS[i].name}`); return; }
+    loadMapLocal(i, netNewGen(), net.id); net.fullT = 0.05; return;
+  }
+  loadMapLocal(i, net.gen, net.hostId);
+}
+function loadMapLocal(i, gen, owner) {
+  const wasApplying = net.applying; net.applying = true;
+  try {
   state.map = i;
   clearAll();
   for (const b of mapBodies) world.removeBody(b);
@@ -1404,6 +1424,14 @@ function loadMap(i) {
   desk.yaw = 0; desk.pitch = 0;
   menu.dirty = true; updateHUD();
   toast(M.name);
+  } finally { net.applying = wasApplying; }
+  net.gen = gen;
+  if (net.on) {
+    net.ents.clear();
+    props.forEach((p, k) => netTag(p, `m${gen}.${k}`, owner, { r: 'map' }));
+    npcs.forEach((n, k) => netTag(n, `mn${gen}.${k}`, owner));
+    for (const e of net.ents.values()) netSetRemote(e, e.owner !== net.id);
+  }
 }
 function applyGravity() { world.gravity.set(0, GRAVITIES[state.gravity].g, 0); for (const p of props) p.body.wakeUp(); }
 
@@ -1493,6 +1521,7 @@ function grabStart(hand, via) {
   const h = castHand(hand);
   if (!h || !h.body || h.isStatic) return;
   const b = h.body;
+  netClaim(b.ent);
   if (b.frozen) setFrozen(b, h.mesh, false);
   if (b.ent?.weapon) {
     if (b.ent.heldBy && b.ent.heldBy !== hand) releaseHold(b.ent.heldBy);
@@ -1566,12 +1595,13 @@ function useTool(tool, hand, h) {
       break;
     case 'freeze':
       if (h && h.body && !h.isStatic) {
+        netClaim(h.ent);
         if (h.ent?.type === 'npc' && h.body.frozen) { for (const [k, b] of Object.entries(h.ent.parts)) setFrozen(b, h.ent.meshes[k], false); h.ent.chill = 0; }
         else setFrozen(h.body, h.mesh, !h.body.frozen);
         SFX.zap(); ring(h.point, h.normal, tcol); hand.pulse(0.4, 40); }
       break;
     case 'balloon':
-      if (h && h.body && !h.isStatic && !h.balloon) { addBalloon(h.body, h.point); SFX.spawn(); hand.pulse(0.3, 30); }
+      if (h && h.body && !h.isStatic && !h.balloon) { { const bl = addBalloon(h.body, h.point), ref = net.on && netBodyRef(h.body); if (ref) { bl.nid = `${net.id}-b${++net.seq}`; netSend({ t: 'bal', bid: bl.nid, ref, l: [bl.local.x, bl.local.y, bl.local.z] }); } } SFX.spawn(); hand.pulse(0.3, 30); }
       break;
     case 'rope': {
       if (!h || (!h.body)) break;
@@ -1579,16 +1609,19 @@ function useTool(tool, hand, h) {
       else {
         const a = hand.ropeStart; hand.ropeStart = null;
         if (a.body === h.body || (a.body.type === STAT && h.body.type === STAT && !a.body.frozen && !h.body.frozen)) { toast('Rope cancelled'); break; }
-        addRope(a.body, a.local, h.body, h.body.pointToLocalFrame(CV(h.point)));
+        const lb = h.body.pointToLocalFrame(CV(h.point));
+        addRope(a.body, a.local, h.body, lb);
+        const ra = net.on && netBodyRef(a.body), rb = net.on && netBodyRef(h.body);
+        if (ra && rb) netSend({ t: 'rope', a: ra, la: [a.local.x, a.local.y, a.local.z], b: rb, lb: [lb.x, lb.y, lb.z], rest: ropes[ropes.length - 1].rest });
         ring(h.point, h.normal, tcol); SFX.spawn(); toast('Tied');
       }
       break;
     }
     case 'paint':
-      if (h && h.mesh?.material?.color) { h.mesh.material.color.setHSL(Math.random(), 0.7, 0.55); if (h.mesh.material.map && !h.isStatic) h.mesh.material.map = null; h.mesh.material.needsUpdate = true; ring(h.point, h.normal, tcol); SFX.click(); }
+      if (h && h.mesh?.material?.color) { h.mesh.material.color.setHSL(Math.random(), 0.7, 0.55); if (h.mesh.material.map && !h.isStatic) h.mesh.material.map = null; h.mesh.material.needsUpdate = true; if (h.ent?.nid) netSend({ t: 'col', id: h.ent.nid, pt: h.body?.npcPart || null, c: h.mesh.material.color.getHex(), nomap: true }); ring(h.point, h.normal, tcol); SFX.click(); }
       break;
     case 'restyle':
-      if (h && h.ent?.type === 'npc') { restyleNPC(h.ent); ring(h.point, h.normal, tcol); SFX.spawn(); toast('NPC restyled'); }
+      if (h && h.ent?.type === 'npc') { netClaim(h.ent); restyleNPC(h.ent); if (h.ent.nid) netSend({ t: 'style', id: h.ent.nid, colors: h.ent.colors }); ring(h.point, h.normal, tcol); SFX.spawn(); toast('NPC restyled'); }
       break;
     case 'remove':
       if (!h) break;
@@ -1610,6 +1643,7 @@ function spawnSelected(hand, h) {
   if (!item.npc) pos.addScaledVector(normal, item.lift + 0.02);
   else pos.y += 0.02;
   const ents = item.spawn(pos, yaw, away);
+  if (item.npc) netRegisterNPC(ents[0]); else netRegisterGroup(ents, { r: 'item', i: state.item, p: R3(pos), y: yaw, d: R3(away) });
   undoStack.push(ents); if (undoStack.length > 60) undoStack.shift();
   SFX.spawn(); hand.pulse(0.3, 25);
   if (h) ring(h.point, h.normal, 0xffb020);
@@ -1707,7 +1741,7 @@ function castRay(origin, dir, range, excludeEnt) {
     const r = resolveHit(h);
     if (!r) continue;
     if (excludeEnt && r.ent === excludeEnt) continue;
-    if (r.ent?.weapon && r.ent.heldBy) continue;
+    if (r.ent?.weapon && (r.ent.heldBy || r.ent.netHeld)) continue;
     return r;
   }
   return null;
@@ -1715,8 +1749,13 @@ function castRay(origin, dir, range, excludeEnt) {
 function hitEnt(hit, dir, o) {
   if (hit.balloon) { popBalloon(hit.balloon); return; }
   burst(hit.point, hit.ent?.type === 'npc' ? 0xb02020 : (o.sparks || 0xffd27a), o.bits ?? 4);
+  if (hit.ent?.type === 'avatar') { netPvpHit(hit.ent, o.dmg, dir); return; }
   const b = hit.body;
   if (!b || hit.isStatic) return;
+  if (net.on && b.ent?.nid && !netMine(b.ent)) { // someone else simulates it: tell them
+    netSend({ t: 'hit', id: b.ent.nid, pt: b.npcPart || null, p: R3(hit.point), d: R3(dir), o: { dmg: o.dmg || 0, impulse: o.impulse || 0 } });
+    return;
+  }
   if (b.ent?.bomb && !b.ent.armed) { b.ent.armed = true; later(0.05, () => detonate(b.ent)); return; }
   if (b.ent?.weapon?.def.name === 'Grenade' && !(b.ent.weapon.fuse > 0) && o.dmg >= 30) b.ent.weapon.fuse = 0.1;
   if (b.type === DYN && o.impulse) b.applyImpulse(new CANNON.Vec3(dir.x * o.impulse, dir.y * o.impulse, dir.z * o.impulse), CV(hit.point).vsub(b.position));
@@ -1734,14 +1773,17 @@ function shoot(h, ent, M, D, o) {
   const hit = castRay(M, dir, 150, ent);
   const end = hit ? hit.point : M.clone().addScaledVector(dir, 150);
   beamMesh(M, end, o.color || 0xffe2a0, o.thick || 0.008, o.life || 0.06);
+  if (net.on) netSend({ t: 'beam', a: R3(M), b: R3(end), c: o.color || 0xffe2a0, w: o.thick || 0.008 });
   if (hit) hitEnt(hit, dir, o);
 }
-function twitch(n) { for (const b of Object.values(n.parts)) if (b.type === DYN) { b.angularVelocity.x += rand(-6, 6); b.angularVelocity.z += rand(-6, 6); b.velocity.y += rand(0, 1.2); } }
+function twitch(n) { if (netFwd(n, 'twitch')) return; for (const b of Object.values(n.parts)) if (b.type === DYN) { b.angularVelocity.x += rand(-6, 6); b.angularVelocity.z += rand(-6, 6); b.velocity.y += rand(0, 1.2); } }
 function ignite(n, t) {
+  if (netFwd(n, 'burn', t)) return;
   n.burn = Math.max(n.burn || 0, t); n.chill = 0;
   for (const [k, b] of Object.entries(n.parts)) if (b.frozen) setFrozen(b, n.meshes[k], false);
 }
 function freezeEnt(t) {
+  if (netFwd(t, 'freeze')) return;
   if (t.type === 'npc') { for (const [k, b] of Object.entries(t.parts)) setFrozen(b, t.meshes[k], true); t.burn = 0; }
   else setFrozen(t.body, t.mesh, true);
   t.chill = 0; SFX.zap();
@@ -1790,7 +1832,11 @@ function meleeHit(ent, e) {
   if (other.ent?.type === 'npc' && v > 2.5) {
     w.lastHit = now;
     const vel = ent.body.velocity.clone(); const n = other.ent;
-    queue.push(() => {
+    if (!netMine(n)) { // their NPC: send the blow to its owner
+      const d = V3(vel.x, vel.y, vel.z), sp = d.length() || 1;
+      netSend({ t: 'hit', id: n.nid, pt: other.npcPart, p: R3(point), d: R3(d.multiplyScalar(1 / sp)), o: { dmg: v * M.dmg * 0.5, impulse: Math.min(80, sp * M.knock * 8) } });
+      SFX.impact(v * 1.5, other.position, 'flesh'); hand?.pulse(0.9, 60);
+    } else queue.push(() => {
       if (M.sharp) woundNPC(n, other.npcPart, point, 'hole', clamp(0.012 + v * 0.0045, 0.02, 0.08), { dir: vel });
       else {
         woundNPC(n, other.npcPart, point, 'bruise', clamp(0.03 + v * 0.006, 0.04, 0.12), { k: clamp(v * 0.1, 0.3, 1) });
@@ -1801,6 +1847,11 @@ function meleeHit(ent, e) {
       other.applyImpulse(vel.scale(M.knock * other.mass * 0.35));
       SFX.impact(v * 1.5, other.position, 'flesh'); burst(point, 0xb02020, 6); hand?.pulse(0.9, 60);
     });
+  } else if (other.ent?.type === 'avatar' && v > 2.5) {
+    w.lastHit = now; netPvpHit(other.ent, v * M.dmg * 0.6, ent.body.velocity); hand?.pulse(0.9, 60);
+  } else if (other.ent?.nid && !netMine(other.ent) && v > 3) {
+    w.lastHit = now; const vl = ent.body.velocity;
+    netSend({ t: 'hit', id: other.ent.nid, pt: other.npcPart || null, p: R3(point), d: R3(V3(vl.x, vl.y, vl.z).normalize()), o: { impulse: Math.min(60, v * M.knock * 2) } });
   } else if (other.type === DYN && v > 3) {
     w.lastHit = now;
     const vel = ent.body.velocity.clone();
@@ -2034,6 +2085,7 @@ function makeWeapon(i, pos, quat) {
   return ent;
 }
 function holdWeapon(hand, ent, via) {
+  netClaim(ent);
   if (hand.held) releaseHold(hand);
   const b = ent.body;
   if (b.frozen) setFrozen(b, ent.mesh, false);
@@ -2051,6 +2103,7 @@ function equipWeapon(i, hand) {
   if (hand.kind === 'desk') { pos.set(0.22, -0.2, -0.42); camera.localToWorld(pos); camera.getWorldQuaternion(q); }
   else { hand.grip.getWorldPosition(pos); q.copy(hand.quat); }
   const ent = makeWeapon(i, pos, q);
+  netRegisterWeapon(ent, i, pos, q);
   undoStack.push([ent]);
   holdWeapon(hand, ent, 'equip');
   setMenuVisible(false);
@@ -2110,7 +2163,7 @@ function updateWeapons(dt) {
     }
   }
   for (const p of props) {
-    const w = p.weapon; if (!w) continue;
+    const w = p.weapon; if (!w || !netMine(p)) continue;
     if (w.loaded) w.loaded.visible = w.cool <= 0;
     if (w.fuse > 0) {
       w.fuse -= sdt; w.beepT = (w.beepT || 0) - sdt;
@@ -2934,6 +2987,7 @@ function duelStart() {
     g.traverse(o => { if (o.isMesh) o.castShadow = true; });
     n.meshes.lArmR.add(g);
   }
+  netRegisterNPC(n);
   duel.enemy = n; duel.active = true; duel.over = null; duel.hp = duel.maxHp; duel.round++; duel.hudDirty = true;
   duel.bar = duelBarSprite();
   const mine = duelMyList()[duel.mine];
@@ -3201,6 +3255,620 @@ function drawDuelPage() {
 }
 
 // ====================================================================
+//  Online multiplayer (Supabase Realtime broadcast + presence, no database)
+//  Every object is simulated by one player (its owner) and mirrored by the
+//  others as a kinematic copy. You take ownership of what you grab, push or
+//  freeze; hits on things someone else owns are sent to that player. The host
+//  (whoever has been in the room longest) owns the map and sends the world to
+//  people who join.
+// ====================================================================
+const NET_URL = 'https://zosucjeljgcyqlqmdari.supabase.co';
+const NET_KEY = 'sb_publishable_RyDZ0bF3k3N8NXdKOqO2vw_7X4D9-Vp';
+const NET_LIB = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.57.4/+esm';
+const NET_COLORS = ['#3fd0c9', '#ffb020', '#e8503a', '#8e5bd6', '#36b37e', '#2f7fe0', '#ff7eb6', '#ececec'];
+const NET_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const G_AVATAR = 32;
+const NPC_KEYS = Object.keys(NPC_PARTS), NPC_CODES = ['active', 'ragdoll', 'dead'];
+const netRandName = () => ['Bonk', 'Wobble', 'Noodle', 'Crash', 'Flop', 'Tumble', 'Splat', 'Yeet', 'Boing', 'Thud'][Math.floor(Math.random() * 10)] + Math.floor(10 + Math.random() * 90);
+const net = {
+  on: false, connecting: false, decided: false, status: 'Offline', code: '', typed: '', id: Math.random().toString(36).slice(2, 10), joinT: 0,
+  name: '', color: 0, host: false, hostId: null, peers: new Map(), ch: null, client: null, lib: null,
+  ents: new Map(), seq: 0, genN: 0, gen: '', out: [], tickT: 0, applying: false, inBoom: false, applyingWound: false, gotFull: false,
+  hp: 100, pvp: true, koT: 0, hudDirty: true, lastWorld: '', decideT: 0, helloT: 0, fullT: 0,
+};
+try { const s = JSON.parse(localStorage.getItem('ragdollLab.net') || '{}'); net.name = s.name || netRandName(); net.color = s.color ?? Math.floor(Math.random() * NET_COLORS.length); }
+catch (e) { net.name = netRandName(); }
+function netSaveProfile() { try { localStorage.setItem('ragdollLab.net', JSON.stringify({ name: net.name, color: net.color })); } catch (e) {} if (net.on) netTrack(); }
+const netMine = (ent) => !net.on || !ent || !ent.nid || ent.owner === net.id;
+const R3 = (v) => [+v.x.toFixed(3), +v.y.toFixed(3), +v.z.toFixed(3)];
+const VA = (a) => V3(a[0], a[1], a[2]);
+const netNewCode = () => Array.from({ length: 4 }, () => NET_LETTERS[Math.floor(Math.random() * NET_LETTERS.length)]).join('');
+function netSend(m) { if (net.on) net.out.push(m); }
+
+// ---- connection -----------------------------------------------------
+async function netConnect(code) {
+  if (net.on || net.connecting) return;
+  net.connecting = true; net.status = 'Connecting…'; net.code = code; menu.dirty = true;
+  try {
+    if (!net.lib) net.lib = await import(NET_LIB);
+    if (!net.client) net.client = net.lib.createClient(NET_URL, NET_KEY, { auth: { persistSession: false, autoRefreshToken: false }, realtime: { params: { eventsPerSecond: 30 } } });
+    const ch = net.client.channel('ragdoll-lab-' + code, { config: { broadcast: { self: false, ack: false }, presence: { key: net.id } } });
+    net.ch = ch;
+    ch.on('broadcast', { event: 'm' }, ({ payload }) => { try { netReceive(payload); } catch (e) { console.warn('net message failed', e); } });
+    ch.on('presence', { event: 'sync' }, () => netPresenceSync());
+    ch.subscribe((status, err) => {
+      if (net.ch !== ch) return; // a room we already left
+      if (status === 'SUBSCRIBED') {
+        Object.assign(net, { on: true, connecting: false, decided: false, gotFull: false, joinT: Date.now(), decideAt: performance.now() + 1500, hp: 100, koT: 0, status: 'Joining…', out: [] });
+        net.ents.clear(); net.lastWorld = netWorldKey();
+        netTrack(); menu.dirty = true; net.hudDirty = true;
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        if (net.on) { netLeave(); toast('Connection lost'); }
+        else if (net.connecting) { net.connecting = false; net.status = 'Could not connect' + (err?.message ? ': ' + err.message : ''); menu.dirty = true; try { net.client.removeChannel(ch); } catch (e) {} net.ch = null; }
+      }
+    });
+  } catch (e) {
+    net.connecting = false; net.status = 'Could not connect: ' + (e.message || e); menu.dirty = true;
+  }
+}
+function netTrack() { net.ch?.track({ id: net.id, name: net.name, color: net.color, t: net.joinT, ready: net.gotFull }); }
+function netLeave() {
+  const ch = net.ch; net.ch = null;
+  if (ch) { try { ch.untrack(); } catch (e) {} try { net.client.removeChannel(ch); } catch (e) {} }
+  for (const p of net.peers.values()) netDropAvatar(p);
+  net.peers.clear();
+  for (const e of net.ents.values()) { e.owner = net.id; netSetRemote(e, false); }
+  net.ents.clear();
+  Object.assign(net, { on: false, connecting: false, decided: false, host: false, hostId: null, status: 'Offline', out: [], hp: 100, koT: 0, gotFull: false, gen: '' });
+  net.hudDirty = true; menu.dirty = true;
+}
+function netPresenceSync() {
+  if (!net.ch) return;
+  const st = net.ch.presenceState(), seen = new Set();
+  for (const [key, metas] of Object.entries(st)) {
+    if (key === net.id || !metas?.length) continue;
+    const m = metas[metas.length - 1]; seen.add(key);
+    let p = net.peers.get(key);
+    if (!p) { p = { id: key, name: m.name || 'Player', color: m.color ?? 0, t: m.t || 0, ready: !!m.ready, pose: null, hp: 100 }; p.av = netMakeAvatar(p); net.peers.set(key, p); if (net.decided) toast(`${p.name} joined`); }
+    else { p.t = m.t || p.t; p.ready = !!m.ready; if (p.name !== m.name || p.color !== m.color) { p.name = m.name; p.color = m.color; netDropAvatar(p); p.av = netMakeAvatar(p); } }
+  }
+  for (const [key, p] of [...net.peers]) if (!seen.has(key)) { netDropAvatar(p); net.peers.delete(key); toast(`${p.name} left`); }
+  if (net.decided) netRecomputeHost();
+  menu.dirty = true; net.hudDirty = true;
+}
+function netNewGen() { return `${net.id}:${++net.genN}`; }
+function netDecide() {
+  net.decided = true; net.status = 'Online'; net.helloAt = 0;
+  netRecomputeHost(); netMaybeOpen();
+  menu.dirty = true; net.hudDirty = true;
+}
+// Nobody here has a world yet and you're first in line: you make it and become the host
+function netMaybeOpen() {
+  if (!net.decided || net.gotFull || !net.host) return;
+  net.gotFull = true;
+  loadMapLocal(state.map, netNewGen(), net.id);
+  netTrack(); toast(`Room ${net.code} is open`);
+  menu.dirty = true; net.hudDirty = true;
+}
+function netRecomputeHost() {
+  // the host is whoever has been here longest among people who already have the world
+  const all = [{ id: net.id, t: net.joinT, ready: net.gotFull }, ...[...net.peers.values()].map(p => ({ id: p.id, t: p.t, ready: !!p.ready }))];
+  const pool = all.some(x => x.ready) ? all.filter(x => x.ready) : all;
+  const list = pool.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+  net.hostId = list[0].id; net.host = net.hostId === net.id;
+  for (const e of net.ents.values()) { // things owned by someone who left go to the host
+    if (e.owner === net.id || net.peers.has(e.owner)) continue;
+    e.owner = net.hostId; if (net.host) netSetRemote(e, false);
+  }
+}
+
+// ---- ownership & mirrored bodies ------------------------------------
+function netSetRemote(ent, remote) {
+  if (!ent || ent.removed || ent.type === 'avatar') return;
+  for (const b of entBodies(ent)) {
+    if (remote) {
+      if (b.netRemote) continue;
+      b.netRemote = true;
+      if (b.type === DYN) { b.netMass = b.mass; b.type = KIN; b.mass = 0; b.updateMassProperties(); }
+    } else {
+      if (!b.netRemote) continue;
+      b.netRemote = false; b.netT = null;
+      if (b.type === KIN && !b.frozen) { b.type = DYN; b.mass = b.netMass || b.origMass || 1; b.updateMassProperties(); b.wakeUp(); }
+    }
+  }
+}
+function netClaim(ent) {
+  if (!net.on || !ent?.nid || ent.owner === net.id || ent.removed) return;
+  ent.owner = net.id; ent.ownT = Date.now(); netSetRemote(ent, false);
+  netSend({ t: 'own', id: ent.nid, ts: ent.ownT });
+}
+function netTag(ent, id, owner, rec) {
+  ent.nid = id; ent.owner = owner; ent.ownT = 0; if (rec) ent.rec = rec;
+  net.ents.set(id, ent);
+}
+const netColOf = (e) => e.mesh?.material?.color ? e.mesh.material.color.getHex() : null;
+function netSetCol(e, c) { if (c != null && e.mesh?.material?.color) e.mesh.material.color.setHex(c); }
+// things you make locally get ids and are announced
+function netRegisterGroup(ents, g) {
+  if (!net.on || !ents?.length) return;
+  const gid = `${net.id}-${++net.seq}`;
+  const ids = ents.map((e, k) => { netTag(e, `${gid}.${k}`, net.id, { ...g, gid, k }); return e.nid; });
+  netSend({ t: 'new', g, ids, cols: ents.map(netColOf) });
+}
+function netRegisterWeapon(ent, i, pos, q) {
+  if (!net.on) return;
+  const data = typeof i === 'number' ? null : customWeapons.find(c => c.def === i)?.data;
+  if (typeof i !== 'number' && !data) return;
+  netRegisterGroup([ent], { r: 'wpn', i: typeof i === 'number' ? i : null, data, p: R3(pos), q: q.toArray().map(v => +v.toFixed(4)) });
+}
+function netSpec(n) {
+  const sp = n.spec || { p: R3(n.parts.torso.position), yaw: n.yaw, o: { height: n.s * 1.8 } };
+  return { p: sp.p, yaw: sp.yaw, o: { ...sp.o, ...n.colors, behavior: n.behavior, health: isFinite(n.maxHealth) ? n.maxHealth : -1 } };
+}
+function netRegisterNPC(n) {
+  if (!net.on || !n) return;
+  netTag(n, `${net.id}-${++net.seq}`, net.id);
+  netSend({ t: 'npc', id: n.nid, spec: netSpec(n) });
+}
+function netMakeNPC(id, spec, owner) {
+  const o = { ...spec.o, health: spec.o.health < 0 ? Infinity : spec.o.health };
+  const was = net.applying; net.applying = true;
+  try {
+    const n = createNPC(VA(spec.p), spec.yaw || 0, o);
+    netTag(n, id, owner); netSetRemote(n, owner !== net.id);
+    return n;
+  } finally { net.applying = was; }
+}
+function netCreateGroup(g, ids, owners, cols) {
+  const was = net.applying; net.applying = true;
+  let ents = [];
+  try {
+    if (g.r === 'item' && ITEMS[g.i] && !ITEMS[g.i].npc) ents = ITEMS[g.i].spawn(VA(g.p), g.y || 0, VA(g.d || [0, 0, 1]));
+    else if (g.r === 'wpn') {
+      const def = g.data ? customDef(g.data) : WEAPONS[g.i] ? g.i : null;
+      if (def != null) ents = [makeWeapon(def, VA(g.p), new THREE.Quaternion(...(g.q || [0, 0, 0, 1])))];
+    }
+    const first = ids.find(Boolean) || '', gid = first.slice(0, first.lastIndexOf('.'));
+    ents.forEach((e, k) => {
+      const id = ids[k];
+      if (!id) { removeEnt(e); return; }
+      netTag(e, id, owners?.[k] ?? net.hostId, { ...g, gid, k });
+      if (cols?.[k] != null) netSetCol(e, cols[k]);
+      netSetRemote(e, e.owner !== net.id);
+    });
+  } finally { net.applying = was; }
+  return ents;
+}
+// a body anywhere in the world, as something the other side can find
+function netBodyRef(b) {
+  if (b.ent?.nid) return { id: b.ent.nid, pt: b.npcPart || null };
+  const m = mapBodies.indexOf(b);
+  return m >= 0 ? { m } : null;
+}
+function netResolveBody(r) {
+  if (!r) return null;
+  if (r.m != null) return mapBodies[r.m] || null;
+  const e = net.ents.get(r.id); if (!e || e.removed) return null;
+  return r.pt ? e.parts?.[r.pt] : e.body;
+}
+// forward an effect on something you don't own to its owner. true = forwarded, so skip it locally
+function netFwd(ent, k, a) {
+  if (!net.on || !ent?.nid || netMine(ent) || net.applying || net.inBoom) return false;
+  netSend({ t: 'fx', id: ent.nid, k, a }); return true;
+}
+
+// ---- state snapshots --------------------------------------------------
+function netPushBody(r, b) {
+  const p = b.position, q = b.quaternion, v = b.velocity;
+  r.push(+p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3), +q.x.toFixed(4), +q.y.toFixed(4), +q.z.toFixed(4), +q.w.toFixed(4), +v.x.toFixed(2), +v.y.toFixed(2), +v.z.toFixed(2));
+}
+function netRecord(ent) {
+  if (ent.type === 'npc') {
+    const r = [ent.nid, 1, Math.max(0, NPC_CODES.indexOf(ent.state)), isFinite(ent.health) ? Math.round(ent.health * 10) / 10 : -1, ent.burn > 0 ? 1 : 0];
+    for (const k of NPC_KEYS) netPushBody(r, ent.parts[k]);
+    return r;
+  }
+  const r = [ent.nid, 0, (ent.body.frozen ? 1 : 0) | (ent.heldBy ? 2 : 0)];
+  netPushBody(r, ent.body);
+  return r;
+}
+function netSetTarget(b, a, o) {
+  if (!b) return;
+  b.netT = { p: new CANNON.Vec3(a[o], a[o + 1], a[o + 2]), q: new THREE.Quaternion(a[o + 3], a[o + 4], a[o + 5], a[o + 6]), v: new CANNON.Vec3(a[o + 7], a[o + 8], a[o + 9]), at: performance.now() };
+}
+function netNPCLook(n, code) {
+  if (code === 'dead' && n.state !== 'dead') {
+    for (const m of Object.values(n.meshes)) if (m.userData.role === 'skin') m.material.color.lerp(new THREE.Color(0x8a9a88), 0.5);
+    n.eyes?.forEach((e, i) => { if (i < 2) e.scale.set(1.6, 0.3, 1); });
+  } else if (code !== 'dead' && n.state === 'dead') {
+    for (const m of Object.values(n.meshes)) m.material.color.set(n.colors[m.userData.role]);
+    n.eyes?.forEach(e => e.scale.set(1, 1, 1)); goreHeal(n);
+  }
+}
+function netApplyRecord(r, from) {
+  const ent = net.ents.get(r[0]);
+  if (!ent || ent.removed || ent.owner === net.id) return;
+  if (from) ent.owner = from;
+  if (r[1] === 1 && ent.type === 'npc') {
+    const code = NPC_CODES[r[2]] || 'active';
+    netNPCLook(ent, code); ent.state = code; ent.health = r[3] < 0 ? Infinity : r[3];
+    if (r[4] & 1) ent.burn = Math.max(ent.burn || 0, 0.3);
+    NPC_KEYS.forEach((k, i) => netSetTarget(ent.parts[k], r, 5 + i * 10));
+  } else if (r[1] === 0 && ent.body) {
+    ent.netHeld = !!(r[2] & 2);
+    const fz = !!(r[2] & 1);
+    if (fz !== !!ent.netFrozen) { ent.netFrozen = fz; ent.mesh.material?.emissive?.setHex(fz ? 0x1d5a9a : (ent.mesh.userData.baseEmissive || 0)); }
+    netSetTarget(ent.body, r, 3);
+  }
+}
+// mirrored bodies glide toward where their owner last said they were
+const _nq1 = new THREE.Quaternion();
+function netFollow(dt, now) {
+  for (const ent of net.ents.values()) {
+    if (ent.removed || ent.owner === net.id) continue;
+    for (const b of entBodies(ent)) {
+      const T = b.netT; if (!T) continue;
+      const age = Math.min(0.25, (now - T.at) / 1000);
+      const tx = T.p.x + T.v.x * age, ty = T.p.y + T.v.y * age, tz = T.p.z + T.v.z * age;
+      const dx = tx - b.position.x, dy = ty - b.position.y, dz = tz - b.position.z;
+      if (b.type !== KIN || dx * dx + dy * dy + dz * dz > 4) {
+        b.position.set(tx, ty, tz); b.previousPosition.copy(b.position); b.interpolatedPosition.copy(b.position);
+        if (b.type === KIN) b.velocity.copy(T.v);
+      } else b.velocity.set(T.v.x + dx * 10, T.v.y + dy * 10, T.v.z + dz * 10);
+      _nq1.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w).slerp(T.q, Math.min(1, dt * 15));
+      b.quaternion.set(_nq1.x, _nq1.y, _nq1.z, _nq1.w);
+      if (b.type !== KIN) b.interpolatedQuaternion.copy(b.quaternion);
+      b.angularVelocity.set(0, 0, 0);
+    }
+  }
+}
+function netWorldKey() { return `${state.gravity},${state.time},${state.paused ? 1 : 0},${state.ai ? 1 : 0}`; }
+function netBuildState(now) {
+  const b = [];
+  for (const ent of net.ents.values()) {
+    if (ent.removed || ent.owner !== net.id) continue;
+    const bodies = entBodies(ent);
+    let moved = now - (ent.netSent || 0) > 2500 || (ent.type === 'npc' && (ent.health !== ent.netHp || ent.state !== ent.netSt));
+    if (!moved) for (const x of bodies) {
+      if (x.velocity.lengthSquared() > 4e-4 || x.angularVelocity.lengthSquared() > 1e-3 || !x.netLast || x.position.distanceTo(x.netLast) > 0.003) { moved = true; break; }
+    }
+    if (!moved) continue;
+    ent.netSent = now; ent.netHp = ent.health; ent.netSt = ent.state;
+    for (const x of bodies) (x.netLast ||= new CANNON.Vec3()).copy(x.position);
+    b.push(netRecord(ent));
+  }
+  return { t: 'st', gen: net.gen, av: netMyPose(), b };
+}
+function netBuildFull() {
+  const groups = new Map(), npcList = [];
+  for (const ent of net.ents.values()) {
+    if (ent.removed) continue;
+    if (ent.type === 'npc') { npcList.push({ id: ent.nid, owner: ent.owner, spec: netSpec(ent) }); continue; }
+    const r = ent.rec || { r: 'map' }, key = r.gid || ent.nid;
+    let G = groups.get(key);
+    if (!G) { const { gid, k, ...g } = r; G = { g, ids: [], owners: [], cols: [] }; groups.set(key, G); }
+    const k = r.gid ? r.k : 0;
+    G.ids[k] = ent.nid; G.owners[k] = ent.owner; G.cols[k] = netColOf(ent);
+  }
+  for (const G of groups.values()) for (let i = 0; i < G.ids.length; i++) { G.ids[i] ??= null; G.owners[i] ??= null; G.cols[i] ??= null; }
+  const bal = balloons.filter(b => b.nid).map(b => ({ bid: b.nid, ref: netBodyRef(b.body), l: [b.local.x, b.local.y, b.local.z] })).filter(b => b.ref);
+  const rp = ropes.map(r => ({ a: netBodyRef(r.a), la: [r.la.x, r.la.y, r.la.z], b: netBodyRef(r.b), lb: [r.lb.x, r.lb.y, r.lb.z], rest: r.rest })).filter(r => r.a && r.b);
+  return {
+    t: 'full', gen: net.gen, map: state.map, pvp: net.pvp,
+    world: { g: state.gravity, time: state.time, paused: state.paused, ai: state.ai },
+    groups: [...groups.values()], npcs: npcList,
+    st: [...net.ents.values()].filter(e => !e.removed).map(netRecord), bal, ropes: rp,
+  };
+}
+function netApplyWorld(w) {
+  state.time = w.time; state.paused = !!w.paused; state.ai = w.ai !== false;
+  if (state.gravity !== w.g) { state.gravity = w.g; applyGravity(); }
+  net.lastWorld = netWorldKey(); menu.dirty = true; updateHUD();
+}
+function netOnFull(f, from) {
+  if (from !== net.hostId) return;
+  if (net.gotFull && f.gen === net.gen) return;
+  const fresh = f.gen !== net.gen || !net.gotFull;
+  net.applying = true;
+  try {
+    if (fresh) { loadMapLocal(f.map, f.gen, from); clearNPCs(); }
+    netApplyWorld(f.world); net.pvp = f.pvp;
+    const want = new Set();
+    for (const G of f.groups) {
+      G.ids.forEach(id => id && want.add(id));
+      const missing = G.ids.some(id => id && !net.ents.has(id));
+      if (missing && G.g.r !== 'map') {
+        G.ids.forEach(id => { const e = id && net.ents.get(id); if (e) removeEnt(e); });
+        netCreateGroup(G.g, G.ids, G.owners, G.cols);
+      } else G.ids.forEach((id, k) => { const e = id && net.ents.get(id); if (e) { e.owner = G.owners[k] ?? from; netSetCol(e, G.cols[k]); } });
+    }
+    for (const N of f.npcs) {
+      want.add(N.id);
+      if (!net.ents.has(N.id)) netMakeNPC(N.id, N.spec, N.owner); else net.ents.get(N.id).owner = N.owner;
+    }
+    for (const e of [...net.ents.values()]) if (!want.has(e.nid)) removeEnt(e);
+    for (const e of net.ents.values()) netSetRemote(e, e.owner !== net.id);
+    for (const r of f.st) netApplyRecord(r, null);
+    if (fresh) {
+      for (const b of f.bal || []) { const body = netResolveBody(b.ref); if (!body) continue; const w = body.pointToWorldFrame(new CANNON.Vec3(...b.l)); addBalloon(body, V3(w.x, w.y, w.z)).nid = b.bid; }
+      for (const r of f.ropes || []) { const a = netResolveBody(r.a), b = netResolveBody(r.b); if (a && b) addRope(a, new CANNON.Vec3(...r.la), b, new CANNON.Vec3(...r.lb), r.rest); }
+    }
+  } finally { net.applying = false; }
+  if (!net.gotFull) { toast(`Joined room ${net.code}`); net.gotFull = true; netTrack(); }
+  net.gen = f.gen; menu.dirty = true; net.hudDirty = true;
+}
+
+// ---- incoming ---------------------------------------------------------
+function netReceive(P) {
+  if (!net.on || !P?.m) return;
+  const from = P.from, peer = net.peers.get(from);
+  for (const m of P.m) {
+    switch (m.t) {
+      case 'st':
+        if (from === net.hostId && m.gen && m.gen !== net.gen && performance.now() >= (net.helloAt || 0)) { // my world isn't the host's: ask for it
+          net.helloAt = performance.now() + 2000; netSend({ t: 'hello', gen: net.gen });
+        }
+        if (peer) { peer.pose = m.av; if (peer.hp !== m.av?.hp) { peer.hp = m.av?.hp; peer.tagDirty = true; } }
+        for (const r of m.b) netApplyRecord(r, from);
+        break;
+      case 'full': netOnFull(m, from); break;
+      case 'hello': if (net.host && net.gotFull && m.gen !== net.gen) net.fullT = 0.3; break;
+      case 'mapreq': if (net.host && MAPS[m.i]) { loadMap(m.i); toast(`${peer?.name || 'Someone'} loaded ${MAPS[m.i].name}`); } break;
+      case 'world': netApplyWorld(m); break;
+      case 'cfg': net.pvp = !!m.pvp; net.hudDirty = true; menu.dirty = true; for (const p of net.peers.values()) p.tagDirty = true; toast(`PvP ${net.pvp ? 'on' : 'off'}`); break;
+      case 'new': if (!m.ids.some(id => id && net.ents.has(id))) netCreateGroup(m.g, m.ids, m.ids.map(() => from), m.cols); break;
+      case 'npc': if (!net.ents.has(m.id)) netMakeNPC(m.id, m.spec, from); break;
+      case 'rm': { const e = net.ents.get(m.id); if (e) { net.applying = true; try { removeEnt(e); } finally { net.applying = false; } } break; }
+      case 'own': {
+        const e = net.ents.get(m.id); if (!e || e.removed) break;
+        if (e.owner === net.id && (e.ownT || 0) > m.ts) break; // my claim is newer
+        e.owner = from; e.ownT = m.ts; netSetRemote(e, true);
+        const bs = entBodies(e);
+        for (const h of hands) { if (h.held && bs.includes(h.held.body)) releaseHold(h); if (h.pushTarget && bs.includes(h.pushTarget.body)) h.pushTarget = null; }
+        break;
+      }
+      case 'hit': {
+        const e = net.ents.get(m.id); if (!e || e.removed || !netMine(e)) break;
+        const body = m.pt ? e.parts?.[m.pt] : e.body; if (!body) break;
+        hitEnt({ point: VA(m.p), normal: V3(0, 1, 0), body, ent: e, isStatic: false }, VA(m.d), m.o);
+        break;
+      }
+      case 'fx': {
+        const e = net.ents.get(m.id); if (!e || e.removed || !netMine(e)) break;
+        if (m.k === 'hurt') hurtNPC(e, m.a); else if (m.k === 'rag') ragdoll(e, m.a); else if (m.k === 'burn') ignite(e, m.a);
+        else if (m.k === 'freeze') freezeEnt(e); else if (m.k === 'twitch') twitch(e); else if (m.k === 'revive') reviveNPC(e);
+        break;
+      }
+      case 'boom': net.applying = true; try { explode(VA(m.p), m.r, m.pw, m.o || {}); } finally { net.applying = false; } break;
+      case 'wd': {
+        const n = net.ents.get(m.id); if (!n || n.removed || n.type !== 'npc' || !n.parts[m.k]) break;
+        const w = n.parts[m.k].pointToWorldFrame(new CANNON.Vec3(...m.p));
+        net.applyingWound = true; try { woundNPC(n, m.k, V3(w.x, w.y, w.z), m.kind, m.size, m.o || {}); } finally { net.applyingWound = false; }
+        break;
+      }
+      case 'col': {
+        const e = net.ents.get(m.id); const mesh = e && (m.pt ? e.meshes?.[m.pt] : e.mesh);
+        if (mesh?.material?.color) { mesh.material.color.setHex(m.c); if (m.nomap && mesh.material.map) { mesh.material.map = null; mesh.material.needsUpdate = true; } }
+        break;
+      }
+      case 'style': {
+        const n = net.ents.get(m.id); if (!n || n.type !== 'npc') break;
+        n.colors = m.colors; if (n.state !== 'dead') for (const ms of Object.values(n.meshes)) ms.material.color.set(n.colors[ms.userData.role]);
+        break;
+      }
+      case 'bal': { const body = netResolveBody(m.ref); if (body) { const w = body.pointToWorldFrame(new CANNON.Vec3(...m.l)); addBalloon(body, V3(w.x, w.y, w.z)).nid = m.bid; } break; }
+      case 'pop': { const b = balloons.find(x => x.nid === m.bid); if (b) { net.applying = true; try { popBalloon(b); } finally { net.applying = false; } } break; }
+      case 'rope': { const a = netResolveBody(m.a), b = netResolveBody(m.b); if (a && b) addRope(a, new CANNON.Vec3(...m.la), b, new CANNON.Vec3(...m.lb), m.rest); break; }
+      case 'beam': beamMesh(VA(m.a), VA(m.b), m.c, m.w, 0.06); break;
+      case 'pvp': if (m.to === net.id) netHurtMe(m.dmg, m.by, m.d); break;
+      case 'ko': toast(m.by ? `${m.by} knocked out ${m.who}` : `${m.who} was knocked out`); break;
+    }
+  }
+}
+
+// ---- PvP ----------------------------------------------------------------
+function netPvpHit(av, dmg, dir) {
+  if (!net.on || !net.pvp || !(dmg > 0) || !av?.peer) return;
+  netSend({ t: 'pvp', to: av.peer, dmg: Math.round(dmg), by: net.name, d: dir ? R3(dir) : null });
+}
+function netHurtMe(a, by, dir) {
+  if (!net.on || !net.pvp || net.koT > 0 || !(a > 0)) return;
+  net.hp = Math.max(0, net.hp - a); net.hudDirty = true;
+  duel.flash = Math.min(1, duel.flash + 0.25 + a / 40);
+  SFX.hurt(headPos); for (const h of hands) h.pulse(Math.min(1, 0.4 + a / 30), 90);
+  if (!renderer.xr.isPresenting && dir) { const d = V3(dir[0], 0, dir[2]); if (d.lengthSq() > 1e-4) rig.position.addScaledVector(d.normalize(), Math.min(0.6, a * 0.015)); }
+  if (net.hp <= 0) {
+    net.koT = 3; duel.flash = 1;
+    toast(by ? `Knocked out by ${by}` : 'Knocked out');
+    netSend({ t: 'ko', who: net.name, by: by || null });
+  }
+}
+function netBlast(pos, radius, o) { // explosions hurt players when PvP is on
+  if (!net.on || !net.pvp || o.dust || duel.active) return;
+  const d = headPos.distanceTo(pos);
+  if (d < radius) netHurtMe(50 * (1 - d / radius), net.inBoomBy || null, null);
+}
+
+// ---- avatars --------------------------------------------------------------
+function netMakeAvatar(p) {
+  const col = NET_COLORS[p.color] || '#cccccc';
+  const ent = { type: 'avatar', name: p.name, peer: p.id, removed: false };
+  const g = new THREE.Group(); g.userData = { kind: 'avatar', ent };
+  const mat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.6 });
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.26, 0.24), mat);
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.19, 0.08, 0.02), new THREE.MeshStandardMaterial({ color: 0x111820, roughness: 0.15, metalness: 0.7 }));
+  visor.position.set(0, 0.025, -0.125); head.add(visor);
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.15, 0.6, 14), mat);
+  const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.1, 0.7, 12), new THREE.MeshStandardMaterial({ color: 0x2b3038, roughness: 0.8 }));
+  const handsM = [0, 1].map(() => new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 8), mat));
+  g.add(head, torso, legs, ...handsM);
+  g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  g.visible = false; dynGroup.add(g);
+  const tagC = document.createElement('canvas'); tagC.width = 512; tagC.height = 128;
+  const tagTex = new THREE.CanvasTexture(tagC); tagTex.colorSpace = THREE.SRGBColorSpace;
+  const tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: tagTex, transparent: true, depthWrite: false, toneMapped: false }));
+  tag.scale.set(0.6, 0.15, 1); tag.visible = false; fxGroup.add(tag);
+  const pb = new CANNON.Body({ mass: 0, type: KIN, collisionFilterGroup: G_AVATAR, collisionFilterMask: G_PROP | G_NPC });
+  pb.addShape(new CANNON.Sphere(0.15)); pb.addShape(new CANNON.Sphere(0.2), new CANNON.Vec3(0, -0.5, 0)); pb.addShape(new CANNON.Sphere(0.16), new CANNON.Vec3(0, -1.0, 0));
+  pb.position.set(0, -50, 0); pb.ent = ent; world.addBody(pb);
+  pb.addEventListener('collide', (e) => { // things you throw at people hurt them
+    const o = e.body.ent;
+    if (!net.pvp || !o || o.type !== 'prop' || !netMine(o) || o.heldBy) return;
+    const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
+    const now = performance.now();
+    if (v < 5 || now - (pb.lastHurt || 0) < 300) return;
+    pb.lastHurt = now; netPvpHit(ent, (v - 4) * 3 * Math.min(2, Math.sqrt(e.body.mass)), null);
+  });
+  const A = { ent, g, head, torso, legs, hands: handsM, tag, tagC, tagTex, pb, h: V3(0, -50, 0), q: new THREE.Quaternion(), lp: [V3(), V3()], seen: false };
+  p.tagDirty = true;
+  return A;
+}
+function netDropAvatar(p) {
+  const A = p.av; if (!A) return;
+  A.ent.removed = true; disposeMesh(A.g);
+  fxGroup.remove(A.tag); A.tag.material.dispose(); A.tagTex.dispose();
+  world.removeBody(A.pb); p.av = null;
+}
+function netDrawTag(p) {
+  const A = p.av, g = A.tagC.getContext('2d');
+  g.clearRect(0, 0, 512, 128);
+  g.font = '700 46px "Chakra Petch", sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.lineWidth = 9; g.strokeStyle = 'rgba(0,0,0,.75)'; g.strokeText(p.name, 256, 42);
+  g.fillStyle = NET_COLORS[p.color] || '#fff'; g.fillText(p.name, 256, 42);
+  if (net.pvp) { const hp = p.hp ?? 100; drawBar(g, 106, 82, 300, 30, Math.max(0, hp) / 100, hp > 50 ? '#36b37e' : hp > 25 ? '#f2b134' : '#e8503a'); }
+  A.tagTex.needsUpdate = true; p.tagDirty = false;
+}
+const _avE = new THREE.Euler(), _avQ = new THREE.Quaternion();
+function netAvatarUpdate(p, dt) {
+  const A = p.av, P = p.pose; if (!A) return;
+  if (!P?.h) { A.g.visible = A.tag.visible = false; return; }
+  const ko = !!P.ko;
+  A.g.visible = !ko; A.tag.visible = !ko;
+  const k = A.seen ? 1 - Math.exp(-dt * 14) : 1; A.seen = true;
+  A.h.lerp(VA(P.h), k); A.q.slerp(_avQ.fromArray(P.q), k);
+  const yaw = _avE.setFromQuaternion(A.q, 'YXZ').y;
+  A.head.position.copy(A.h); A.head.quaternion.copy(A.q);
+  A.torso.position.set(A.h.x, A.h.y - 0.5, A.h.z); A.torso.rotation.set(0, yaw, 0);
+  const top = A.h.y - 0.8, gy = Math.min(P.g ?? top - 0.7, top - 0.15), len = top - gy;
+  A.legs.position.set(A.h.x, (top + gy) / 2, A.h.z); A.legs.scale.set(1, len / 0.7, 1); A.legs.rotation.set(0, yaw, 0);
+  ['l', 'r'].forEach((key, i) => {
+    const m = A.hands[i], v = P[key];
+    m.visible = !!v; if (v) { if (!A.lp[i].seenOnce) { A.lp[i].copy(VA(v)); A.lp[i].seenOnce = true; } A.lp[i].lerp(VA(v), k); m.position.copy(A.lp[i]); }
+  });
+  A.tag.position.set(A.h.x, A.h.y + 0.34, A.h.z);
+  if (p.tagDirty) netDrawTag(p);
+  const pb = A.pb;
+  if (ko) { pb.position.set(0, -50, 0); pb.velocity.set(0, 0, 0); return; }
+  const idt = 1 / Math.max(dt, 1e-3);
+  pb.velocity.set((A.h.x - pb.position.x) * idt, (A.h.y - pb.position.y) * idt, (A.h.z - pb.position.z) * idt);
+  if (pb.position.y < -40) pb.velocity.set(0, 0, 0);
+  pb.position.set(A.h.x, A.h.y, A.h.z);
+}
+function netMyPose() {
+  const q = new THREE.Quaternion(); camera.getWorldQuaternion(q);
+  let l = null, r = null;
+  if (renderer.xr.isPresenting) {
+    for (const h of vrHands) if (h.active) { const p = V3(); h.grip.getWorldPosition(p); if (h === leftHand()) l = R3(p); else r = R3(p); }
+  } else r = R3(desk.held?.weapon ? desk.held.target : V3(0.25, -0.3, -0.35).applyQuaternion(q).add(headPos));
+  return { h: R3(headPos), q: q.toArray().map(v => +v.toFixed(3)), l, r, g: +rig.position.y.toFixed(2), hp: Math.round(net.hp), ko: net.koT > 0 ? 1 : 0 };
+}
+
+// ---- HUD (room, players, your health) -------------------------------------
+const netHud = { c: document.createElement('canvas') };
+netHud.c.width = 900; netHud.c.height = 150; netHud.c.id = 'netHud'; netHud.c.hidden = true;
+document.body.appendChild(netHud.c);
+netHud.tex = new THREE.CanvasTexture(netHud.c); netHud.tex.colorSpace = THREE.SRGBColorSpace;
+netHud.mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.0333), new THREE.MeshBasicMaterial({ map: netHud.tex, transparent: true, depthTest: false, toneMapped: false }));
+netHud.mesh.position.set(0.17, -0.25, -0.6); netHud.mesh.renderOrder = 1001; netHud.mesh.visible = false; camera.add(netHud.mesh);
+function drawNetHud() {
+  const g = netHud.c.getContext('2d'), W = 900, H = 150;
+  g.clearRect(0, 0, W, H);
+  rr(g, 4, 4, W - 8, H - 8, 20); g.fillStyle = 'rgba(14,19,27,.88)'; g.fill(); g.lineWidth = 3; g.strokeStyle = C.line; g.stroke();
+  g.textBaseline = 'middle'; g.textAlign = 'left';
+  g.font = '700 38px "Chakra Petch", sans-serif'; g.fillStyle = C.accent2;
+  const n = net.peers.size + 1;
+  g.fillText(net.decided ? `ROOM ${net.code} · ${n} PLAYER${n === 1 ? '' : 'S'}${net.host ? ' · HOST' : ''}` : `JOINING ${net.code}…`, 28, 46);
+  if (net.pvp) {
+    const f = net.hp / 100;
+    drawBar(g, 28, 86, 700, 44, f, f > 0.5 ? '#36b37e' : f > 0.25 ? '#f2b134' : '#e8503a');
+    g.font = '700 38px "IBM Plex Sans", sans-serif'; g.fillStyle = C.fg; g.textAlign = 'right';
+    g.fillText(net.koT > 0 ? 'OUT' : `${Math.ceil(net.hp)}`, 872, 108);
+  } else { g.font = '600 32px "IBM Plex Sans", sans-serif'; g.fillStyle = C.muted; g.fillText('PvP off', 28, 108); }
+  netHud.tex.needsUpdate = true; net.hudDirty = false;
+}
+
+// ---- per frame ---------------------------------------------------------------
+function netUpdate(dt) {
+  const vr = renderer.xr.isPresenting;
+  netHud.c.hidden = !net.on || vr || !started; netHud.mesh.visible = net.on && vr;
+  if (!net.on) return;
+  if (net.hudDirty) drawNetHud();
+  const now = performance.now();
+  if (!net.decided) { if (now >= net.decideAt) netDecide(); return; }
+  netFollow(dt, now);
+  for (const p of net.peers.values()) netAvatarUpdate(p, dt);
+  if (net.koT > 0) {
+    duel.flash = Math.max(duel.flash, 0.7);
+    if ((net.koT -= dt) <= 0) { net.hp = 100; const s = MAPS[state.map].spawn; rig.position.set(...s); player.vy = 0; net.hudDirty = true; toast('Back in'); }
+  }
+  if (!net.gotFull && now >= (net.helloAt || 0)) { // still waiting for the world
+    net.helloAt = now + 1500; netRecomputeHost();
+    if (net.host) netMaybeOpen(); else netSend({ t: 'hello', gen: '' });
+  }
+  if (net.fullT > 0 && (net.fullT -= dt) <= 0) netSend(netBuildFull());
+  const wk = netWorldKey();
+  if (wk !== net.lastWorld) { net.lastWorld = wk; netSend({ t: 'world', g: state.gravity, time: state.time, paused: state.paused, ai: state.ai }); }
+  if ((net.tickT -= dt) <= 0) {
+    net.tickT = net.peers.size > 3 ? 0.16 : 0.1;
+    if (!net.peers.size) { net.out.length = 0; return; }
+    netSend(netBuildState(now));
+    const batch = net.out; net.out = [];
+    net.ch?.send({ type: 'broadcast', event: 'm', payload: { from: net.id, m: batch } }).catch?.(() => {});
+  }
+}
+
+// ---- Online tab ---------------------------------------------------------------
+function drawOnlinePage() {
+  const head = '700 18px "Chakra Petch", sans-serif';
+  if (!net.on) {
+    wrapText('Play with friends over the internet. Create a room and give them its code, or jump into the public lobby. Going online restarts the current map.', 40, 178, 940);
+    mlabel(40, 266, 'YOU', { font: head });
+    mbtn(130, 238, 400, 56, net.name, () => {
+      if (renderer.xr.isPresenting) { net.name = netRandName(); netSaveProfile(); return; }
+      const n = prompt('Your name', net.name); if (n && n.trim()) { net.name = n.trim().slice(0, 16); netSaveProfile(); }
+    }, { size: 24 });
+    mbtn(540, 238, 110, 56, '🎲', () => { net.name = netRandName(); netSaveProfile(); }, { size: 24 });
+    mbtn(660, 238, 332, 56, 'Colour', () => { net.color = cyc(net.color, NET_COLORS.length, 1); netSaveProfile(); }, { swatch: NET_COLORS[net.color], size: 22 });
+    mbtn(32, 310, 470, 76, 'Create room', () => netConnect(netNewCode()), { active: true, size: 28, sub: 'Get a code to share' });
+    mbtn(522, 310, 470, 76, 'Join public lobby', () => netConnect('LOBBY'), { size: 28, sub: 'Play with anyone who is on' });
+    mlabel(40, 428, 'JOIN WITH A CODE', { font: head });
+    mbtn(260, 402, 230, 52, (net.typed || '').padEnd(4, '·'), null, { size: 30 }); menu.buttons[menu.buttons.length - 1].fn = null;
+    mbtn(500, 402, 100, 52, '⌫', () => { net.typed = net.typed.slice(0, -1); }, { size: 24 });
+    mbtn(610, 402, 382, 52, 'Join room', () => { if (net.typed.length === 4) netConnect(net.typed); }, { active: net.typed.length === 4, size: 24 });
+    [...NET_LETTERS].forEach((L, i) => mbtn(32 + (i % 12) * 80.5, 466 + Math.floor(i / 12) * 58, 74, 52, L, () => { if (net.typed.length < 4) net.typed += L; }, { size: 24 }));
+    mlabel(40, 604, net.status, { color: net.status.startsWith('Could') ? '#ff6a5a' : C.muted, font: '600 20px "IBM Plex Sans", sans-serif' });
+    return;
+  }
+  mlabel(40, 184, `ROOM ${net.code}`, { font: '700 40px "Chakra Petch", sans-serif', color: C.accent });
+  mlabel(330, 186, !net.decided ? 'Joining…' : !net.gotFull ? 'Getting the world from the host…' : net.host ? 'You are the host' : 'Connected', { color: C.fg });
+  const people = [{ name: net.name, color: net.color, hp: net.hp, me: true, host: net.host }, ...[...net.peers.values()].map(p => ({ name: p.name, color: p.color, hp: p.hp ?? 100, host: p.id === net.hostId }))];
+  people.slice(0, 8).forEach((p, i) => {
+    const y = 236 + i * 46, g = menu.ctx;
+    g.fillStyle = NET_COLORS[p.color] || '#ccc'; g.beginPath(); g.arc(52, y, 12, 0, 7); g.fill();
+    mlabel(76, y, `${p.name}${p.me ? ' (you)' : ''}${p.host ? ' · host' : ''}`, { color: C.fg, font: '600 24px "IBM Plex Sans", sans-serif' });
+    if (net.pvp) mlabel(560, y, `${Math.max(0, Math.ceil(p.hp))} HP`, { align: 'right' });
+  });
+  if (people.length > 8) mlabel(76, 236 + 8 * 46, `+${people.length - 8} more`);
+  mbtn(612, 222, 380, 66, net.pvp ? 'PvP: on' : 'PvP: off', () => { net.pvp = !net.pvp; netSend({ t: 'cfg', pvp: net.pvp }); net.hudDirty = true; for (const p of net.peers.values()) p.tagDirty = true; }, { active: net.pvp, size: 24, sub: 'Weapons and explosions hurt players' });
+  if (!renderer.xr.isPresenting) mbtn(612, 300, 380, 66, 'Copy invite link', () => {
+    const url = location.origin + location.pathname + '?room=' + net.code;
+    navigator.clipboard?.writeText(url).then(() => toast('Invite link copied'), () => toast(url));
+  }, { size: 24 });
+  mbtn(612, 378, 380, 66, 'Leave room', () => { netLeave(); toast('Left the room'); }, { size: 24 });
+  wrapText('Everyone shares one world. Whatever you grab is simulated on your computer until someone else grabs it. Anyone can change the map, gravity or time.', 40, 600, 940);
+}
+
+// ====================================================================
 //  Menu panel (canvas texture, works in VR on the left wrist and on desktop)
 // ====================================================================
 const MW = 1024, MH = 720;
@@ -3283,7 +3951,7 @@ function drawMenu() {
   g.fillStyle = C.fg; g.fillText('RAGDOLL', 32, 62); const w = g.measureText('RAGDOLL').width;
   g.fillStyle = C.accent; g.fillText('LAB', 32 + w + 6, 62);
   mlabel(MW - 32, 48, `${MAPS[state.map].name} · ${props.length} props · ${npcs.length} NPCs`, { align: 'right', font: '600 20px "IBM Plex Sans", sans-serif' });
-  const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['workshop', 'Workshop'], ['duel', 'Duel'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World']];
+  const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['workshop', 'Workshop'], ['duel', 'Duel'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World'], ['online', 'Online']];
   if (ws.active) {
     const si = WS_STEPS.indexOf(ws.step);
     WS_STEP_NAMES.forEach((n, i) => {
@@ -3291,10 +3959,11 @@ function drawMenu() {
       g.fillStyle = i === si ? C.accent : i < si ? '#24402f' : C.btn; g.fill();
       mlabel(x + 92, 117, `${i + 1}  ${n}`, { align: 'center', color: i === si ? '#1a1205' : C.fg, font: '700 22px "Chakra Petch", sans-serif' });
     });
-  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 120, 88, 114, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 20 }));
+  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 107, 88, 101, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 18 }));
   const P = ws.active ? 'workshop' : menu.page;
   if (P === 'workshop') drawWorkshopPage();
   if (P === 'duel') drawDuelPage();
+  if (P === 'online') drawOnlinePage();
   if (P === 'weapons') {
     WEAPONS.forEach((w, i) => mbtn(32 + (i % 3) * 323, 160 + Math.floor(i / 3) * 92, 313, 84, w.name, () => equipWeapon(i, menu.clickHand), { sub: w.sub, left: true, size: 24 }));
     wrapText('Picking a weapon puts it in your hand. VR: trigger fires, squeeze and let go to drop or throw. Desktop: left click fires, right click throws, F drops. Draw your own in the Workshop tab.', 40, 556, 940);
@@ -3562,6 +4231,8 @@ renderer.xr.addEventListener('sessionend', () => {
 $('playDesk').addEventListener('click', () => { initAudio(); start(); tryLock(); });
 function start() {
   started = true; $('start').hidden = true; updateLockUI(); updateHUD();
+  const rc = new URLSearchParams(location.search).get('room');
+  if (rc && !net.on) { netConnect(rc.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8)); menu.page = 'online'; }
 }
 
 // ====================================================================
@@ -3736,10 +4407,11 @@ function updateHands(dt) {
         end = hit.point; dotOn = true;
         if (h.kind === 'desk') {
           if (hit.ent?.type === 'npc') { const n = hit.ent; deskInfo = `${n.state === 'dead' ? 'Dead' : BEHAVIORS[n.behavior]} NPC · ${isFinite(n.health) ? Math.ceil(n.health) + '/' + n.maxHealth + ' HP' : 'Unbreakable'}${n.state === 'ragdoll' ? ' · knocked out' : ''}`; }
+          else if (hit.ent?.type === 'avatar') deskInfo = `${hit.ent.name}${net.pvp ? ' · ' + Math.ceil(net.peers.get(hit.ent.peer)?.hp ?? 100) + ' HP' : ''}`;
           else if (hit.balloon) deskInfo = 'Balloon';
           else if (hit.ent) deskInfo = `${hit.ent.name}${hit.body?.frozen ? ' · frozen' : ''} · ${Math.round(hit.body?.frozen ? hit.body.origMass : hit.body.mass)} kg`;
         }
-        if (h.pushing && hit.body && !hit.isStatic) { h.pushTarget = { body: hit.body, local: hit.body.pointToLocalFrame(CV(hit.point)) }; if (hit.ent?.type === 'npc') ragdoll(hit.ent, 1.2); }
+        if (h.pushing && hit.body && !hit.isStatic) { netClaim(hit.body.ent); h.pushTarget = { body: hit.body, local: hit.body.pointToLocalFrame(CV(hit.point)) }; if (hit.ent?.type === 'npc') ragdoll(hit.ent, 1.2); }
         else h.pushTarget = null;
       } else h.pushTarget = null;
       if (h.pushing) showLaser = true;
@@ -3806,7 +4478,7 @@ function syncVisuals(dt) {
     const b = p.body; const pp = paused ? b.position : b.interpolatedPosition, pq = paused ? b.quaternion : b.interpolatedQuaternion;
     if (p.weapon && p.heldBy?.held?.body === b) { p.mesh.position.copy(p.heldBy.held.target); p.mesh.quaternion.copy(p.heldBy.held.tq); }
     else { p.mesh.position.set(pp.x, pp.y, pp.z); p.mesh.quaternion.set(pq.x, pq.y, pq.z, pq.w); }
-    if (p.body.position.y < -60) queue.push(() => removeEnt(p));
+    if (p.body.position.y < -60 && netMine(p)) queue.push(() => removeEnt(p));
     if (p.fuse) p.fuse.material.emissiveIntensity = 0.5 + 0.5 * Math.sin(performance.now() / 90);
   }
   for (const n of npcs) for (const [k, m] of Object.entries(n.meshes)) {
@@ -3846,6 +4518,7 @@ renderer.setAnimationLoop(() => {
     camera.getWorldPosition(headPos);
   }
   updateHands(dt);
+  netUpdate(dt);
   wsUpdate(dt);
   updateWeapons(dt);
   updateProjectiles(dt);
@@ -3877,5 +4550,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera };
 </script>
