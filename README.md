@@ -8,6 +8,10 @@ Play: open `index.html` over HTTPS (GitHub Pages works) in a WebXR browser such 
 
 Twelve weapons live in the Weapons tab of the menu: Pistol, Shotgun, SMG, Rocket Launcher, Grenade, Crossbow, Sword, Baseball Bat, Sledgehammer, Flamethrower, Lightning Gun and Freeze Ray. They are physical objects, so you can drop, throw and pick them up again. Melee weapons hit with real swings. Headshots do double damage, burning NPCs panic, and lightning arcs between nearby NPCs.
 
+## Duel
+
+The Duel tab sets up a one-on-one fight against a ragdoll that fights back. Pick its weapon (fists, sword, bat, sledgehammer, pistol, shotgun, SMG, crossbow, rocket launcher, flamethrower, lightning gun or random), the difficulty (Easy, Normal, Hard or Brutal) and the weapon you start with (any of the 12, or one you drew). The opponent closes in to swing at you or keeps its distance and strafes while shooting. You have 100 health, shown at the top of the screen (in VR, low in your view), and the screen flashes red when you are hit. Objects between you and the opponent block its shots, moving makes it miss more, and explosions hurt you, your own included. Knock it out to win, then pick Rematch or Leave duel.
+
 ## Gore
 
 NPCs have a skeleton (skull, spine, ribs, pelvis and limb bones) and organs (brain, lungs, heart, liver, stomach, kidneys and intestines) inside them. Bullets, blades, explosions and very hard impacts take chunks out of the body so you can see inside, throw out bits of meat and leave blood on the ground. Wounded NPCs keep bleeding for a while. Blunt hits, falls and being thrown into things leave bruises that darken with repeated hits, and fire chars the skin. Reviving an NPC heals it. Set **World → Gore** to Full, Bruises only or Off. **Clean up blood** removes the mess.

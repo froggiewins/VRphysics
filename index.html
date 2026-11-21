@@ -23,6 +23,7 @@ html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); c
 #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
 #menuDom { position: fixed; z-index: 20; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(94vw, calc(90vh * 1024 / 720), 1500px); height: auto; border-radius: 1.6%; box-shadow: 0 10px 40px rgba(0,0,0,.6); user-select: none; }
 #menuDom.dock { left: 12px; transform: translateY(-50%); width: min(max(44vw, 500px), 60vw, calc(92vh * 1024 / 720)); }
+#duelHud { position: fixed; z-index: 15; left: 50%; top: calc(76px + env(safe-area-inset-top, 0px)); transform: translateX(-50%); width: min(560px, 70vw); height: auto; pointer-events: none; }
 #cross { position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px; pointer-events: none; }
 #cross::before, #cross::after { content: ""; position: absolute; background: var(--fg); opacity: .85; box-shadow: 0 0 2px #000; }
 #cross::before { left: 8px; top: 0; width: 2px; height: 18px; }
@@ -947,7 +948,9 @@ function npcThink(n, dt) {
   const dist = Math.hypot(dx, dz);
   let speed = 0, dirx = 0, dirz = 0;
   const ai = state.ai;
-  if (n.burn > 0) { // on fire: run around in a panic
+  if (n.duel && !(n.burn > 0)) { // duel opponent: hunt the player
+    const r = duelBrain(n, dt, dx, dz, dist); speed = r[0]; dirx = r[1]; dirz = r[2];
+  } else if (n.burn > 0) { // on fire: run around in a panic
     n.panicT = (n.panicT || 0) - dt;
     if (n.panicT <= 0) { n.panicT = rand(0.5, 1.1); n.panicA = Math.random() * Math.PI * 2; }
     speed = 3.6; dirx = Math.sin(n.panicA); dirz = Math.cos(n.panicA);
@@ -976,10 +979,11 @@ function npcThink(n, dt) {
       break;
   }
   if (speed > 0) n.yaw = Math.atan2(dirx, dirz);
+  if (n.duel && n.duelFace && !(n.burn > 0)) n.yaw = Math.atan2(dx, dz); // strafing and backing off while facing you
   n.vd.set(dirx * speed * n.s, 0, dirz * speed * n.s);
   const hs = Math.hypot(T.velocity.x, T.velocity.z);
   n.phase += dt * hs * (Math.PI * 2) / (1.1 * n.s);
-  n.dance = ai && n.behavior === 4;
+  n.dance = n.duel ? !!n.duelDance : ai && n.behavior === 4;
   n.danceT = (n.danceT || 0) + dt;
 }
 
@@ -1045,7 +1049,8 @@ function npcControl(n) {
     springTo(n.parts['lLeg' + L], ftx, fty + 0.225 * s, ftz, 60, 9, T.velocity, k);
     springTo(n.parts['uLeg' + L], (_hip.x + kx) / 2, (_hip.y + ky) / 2, (_hip.z + kz) / 2, 60, 9, T.velocity, k);
     _l.set(side * 0.24 * s, 0.26 * s, 0); T.pointToWorldFrame(_l, _sh);
-    if (n.dance) {
+    if (n.duel && side > 0 && !n.dance) duelArm(n, k);
+    else if (n.dance) {
       const wave = Math.sin(n.danceT * 6 + side) * 0.12 * s;
       springTo(n.parts['lArm' + L], _sh.x + fz * wave * side, _sh.y + 0.42 * s, _sh.z - fx * wave * side, 35, 6, T.velocity, k);
       springTo(n.parts['uArm' + L], _sh.x, _sh.y + 0.14 * s, _sh.z, 35, 6, T.velocity, k);
@@ -1088,6 +1093,7 @@ function removeRope(r) { ropes.splice(ropes.indexOf(r), 1); r.line.geometry.disp
 function clearProps() { while (props.length) removeEnt(props[props.length - 1]); }
 function clearNPCs() { while (npcs.length) removeEnt(npcs[npcs.length - 1]); }
 function clearAll() {
+  if (duel.active) duelEnd();
   clearProps(); clearNPCs();
   while (balloons.length) removeBalloon(balloons[0]);
   while (ropes.length) removeRope(ropes[0]);
@@ -1180,6 +1186,7 @@ function explode(pos, radius = 5, power = 1, o = {}) {
     if (maxF > 0) { ragdoll(n, (o.dust ? 1.2 : 3) + maxF * 2); hurtNPC(n, (o.dmg ?? 90) * maxF); }
   }
   for (const b of balloons.slice()) if (b.mesh.position.distanceTo(pos) < radius * 0.7) popBalloon(b);
+  duelBlast(pos, radius, o);
 }
 function dustFX(pos, r) {
   const m = new THREE.Mesh(new THREE.RingGeometry(0.7, 1, 40), new THREE.MeshBasicMaterial({ color: 0xb8a990, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
@@ -2666,6 +2673,323 @@ function drawWorkshopPage() {
 }
 
 // ====================================================================
+//  Duel mode: one armed ragdoll that hunts you and fights back
+// ====================================================================
+const DUEL_WEAPONS = [
+  { name: 'Fists', melee: true, reach: 1.05, dmg: 8, cd: 0.8, wind: 0.28, knock: 0.15 },
+  { name: 'Sword', melee: true, reach: 1.6, dmg: 16, cd: 1.0, wind: 0.35, knock: 0.2, model: 'Sword' },
+  { name: 'Baseball Bat', melee: true, reach: 1.5, dmg: 13, cd: 1.1, wind: 0.4, knock: 0.5, model: 'Baseball Bat' },
+  { name: 'Sledgehammer', melee: true, reach: 1.6, dmg: 26, cd: 1.9, wind: 0.65, knock: 0.8, model: 'Sledgehammer' },
+  { name: 'Pistol', range: 7, dmg: 9, cd: 0.85, acc: 1, model: 'Pistol' },
+  { name: 'Shotgun', range: 4.5, dmg: 5, pellets: 6, cd: 1.6, acc: 0.8, model: 'Shotgun' },
+  { name: 'SMG', range: 7.5, dmg: 4, cd: 0.13, acc: 0.65, model: 'SMG' },
+  { name: 'Crossbow', range: 9, dmg: 24, cd: 2.2, proj: 'bolt', speed: 30, model: 'Crossbow' },
+  { name: 'Rocket Launcher', range: 11, cd: 3.2, proj: 'rocket', speed: 15, model: 'Rocket Launcher' },
+  { name: 'Flamethrower', range: 3.2, flame: true, dps: 14, model: 'Flamethrower' },
+  { name: 'Lightning Gun', range: 6, dmg: 8, cd: 0.55, acc: 0.9, bolt: true, model: 'Lightning Gun' },
+];
+const DUEL_DIFF = [
+  { name: 'Easy', hp: 120, acc: 0.35, dmg: 0.6, speed: 0.75, cd: 1.35, desc: 'Slow, clumsy and fragile.' },
+  { name: 'Normal', hp: 200, acc: 0.55, dmg: 1, speed: 1, cd: 1, desc: 'A fair fight.' },
+  { name: 'Hard', hp: 320, acc: 0.72, dmg: 1.35, speed: 1.2, cd: 0.8, desc: 'Quick, tough and a good shot.' },
+  { name: 'Brutal', hp: 500, acc: 0.85, dmg: 1.8, speed: 1.4, cd: 0.6, desc: 'Good luck.' },
+];
+const duel = { active: false, enemy: null, w: 0, diff: 1, mine: 0, hp: 100, maxHp: 100, wins: 0, losses: 0, round: 0, over: null, cur: null, shots: [], flash: 0, lastHead: V3(), headVel: 0, hurtSnd: 0, bar: null, hudDirty: true };
+const duelDiff = () => DUEL_DIFF[duel.diff];
+function duelMyList() {
+  return [{ name: 'Keep current' }, ...WEAPONS.map((w, i) => ({ name: w.name, i })), ...customWeapons.map(c => ({ name: c.def.name, def: c.def }))];
+}
+function duelHand(n) { const w = n.parts.lArmR.pointToWorldFrame(new CANNON.Vec3(0, -0.17 * n.s, 0)); return V3(w.x, w.y, w.z); }
+function playerTarget() { return headPos.clone().add(V3(0, -0.22, 0)); } // aim at the chest
+
+function duelStart() {
+  if (ws.active) wsEnd();
+  duelClearRound();
+  clearNPCs();
+  const D = duelDiff();
+  duel.cur = DUEL_WEAPONS[duel.w >= DUEL_WEAPONS.length ? Math.floor(Math.random() * DUEL_WEAPONS.length) : duel.w];
+  const fwd = V3(); camera.getWorldDirection(fwd); fwd.y = 0;
+  if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
+  const W = duel.cur, dist = W.melee ? 7 : Math.min(9, W.range + 2);
+  const p = V3(headPos.x, 0, headPos.z).addScaledVector(fwd, dist);
+  let gy = 0;
+  const r = new CANNON.RaycastResult();
+  if (world.raycastClosest(new CANNON.Vec3(p.x, headPos.y + 8, p.z), new CANNON.Vec3(p.x, -20, p.z), { collisionFilterMask: G_WORLD | G_PROP, skipBackfaces: true }, r)) gy = r.hitPointWorld.y;
+  const n = createNPC(V3(p.x, gy + 0.02, p.z), Math.atan2(-fwd.x, -fwd.z), { shirt: '#7a1f2b', pants: '#1b1b1b', skin: SKINS[2], height: 1.85, behavior: 0, health: D.hp });
+  Object.assign(n, { name: 'Duelist', duel: true, duelCd: 1.6, duelPhase: null, strafe: 1, strafeT: 0 });
+  if (W.model) { // the weapon it carries (just for show: its attacks are simulated)
+    const g = new THREE.Group(); WEAPON_BY_NAME(W.model).build(g);
+    g.position.set(0, -0.15 * n.s, 0); g.rotation.x = -Math.PI / 2;
+    g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+    n.meshes.lArmR.add(g);
+  }
+  duel.enemy = n; duel.active = true; duel.over = null; duel.hp = duel.maxHp; duel.round++; duel.hudDirty = true;
+  duel.bar = duelBarSprite();
+  const mine = duelMyList()[duel.mine];
+  if (mine?.def) equipWeapon(mine.def, menu.clickHand); else if (mine?.i != null) equipWeapon(mine.i, menu.clickHand);
+  setMenuVisible(false);
+  if (!renderer.xr.isPresenting) tryLock();
+  toast(`Round ${duel.round}: they have ${/^[AEIOU]/.test(W.name) ? 'an' : 'a'} ${W.name.toLowerCase()}. Fight!`);
+  SFX.spawn();
+}
+function duelClearRound() {
+  for (const s of duel.shots) disposeMesh(s.mesh);
+  duel.shots.length = 0;
+  if (duel.bar) { fxGroup.remove(duel.bar.sp); duel.bar.tex.dispose(); duel.bar.sp.material.dispose(); duel.bar = null; }
+  if (duel.enemy && !duel.enemy.removed) removeEnt(duel.enemy);
+  duel.enemy = null;
+}
+function duelEnd() {
+  if (!duel.active) return;
+  duelClearRound();
+  duel.active = false; duel.over = null; duel.flash = 0; duel.hudDirty = true;
+  toast('Duel over');
+}
+function duelOver(res) {
+  if (duel.over) return;
+  duel.over = res; duel.hudDirty = true;
+  if (res === 'win') { duel.wins++; toast('You win!'); SFX.spawn(); }
+  else { duel.losses++; toast('You were knocked out!'); SFX.boom(headPos); }
+  for (const s of duel.shots) disposeMesh(s.mesh);
+  duel.shots.length = 0;
+  later(1.8, () => { if (duel.active && duel.over) { menu.page = 'duel'; setMenuVisible(true); } });
+}
+function damagePlayer(a, from, knock = 0.2) {
+  if (!duel.active || duel.over || !(a > 0)) return;
+  duel.hp = Math.max(0, duel.hp - a); duel.hudDirty = true;
+  duel.flash = Math.min(1, duel.flash + 0.25 + a / 40);
+  const now = performance.now();
+  if (now - duel.hurtSnd > 350) { duel.hurtSnd = now; SFX.hurt(headPos); for (const h of hands) h.pulse(Math.min(1, 0.4 + a / 30), 90); }
+  if (!renderer.xr.isPresenting && from && knock > 0) { // a shove on PC (moving a VR player would feel awful)
+    const d = V3(headPos.x - from.x, 0, headPos.z - from.z);
+    if (d.lengthSq() > 1e-4) rig.position.addScaledVector(d.normalize(), knock * 0.5);
+  }
+  if (duel.hp <= 0) duelOver('lose');
+}
+
+// Brain: returns [speed, dirx, dirz]
+function duelBrain(n, dt, dx, dz, dist) {
+  const W = duel.cur, D = duelDiff();
+  n.duelFace = true;
+  if (!duel.active || duel.over || !W) { n.duelDance = duel.over === 'lose'; n.duelPhase = null; return [0, 0, 0]; }
+  n.duelDance = false;
+  const ux = dist > 1e-3 ? dx / dist : 0, uz = dist > 1e-3 ? dz / dist : 1;
+  const spd = D.speed * (n.health / n.maxHealth < 0.3 ? 0.7 : 1); // limps when badly hurt
+  n.duelCd -= dt;
+  if (W.melee) {
+    if (n.duelPhase) {
+      n.duelT -= dt;
+      if (n.duelPhase === 'wind' && n.duelT <= 0) { n.duelPhase = 'strike'; n.duelT = 0.16; duelMeleeStrike(n); }
+      else if (n.duelPhase === 'strike' && n.duelT <= 0) { n.duelPhase = null; n.duelCd = W.cd * D.cd * rand(0.8, 1.25); }
+      return [0.5 * spd, ux, uz]; // small lunge
+    }
+    if (dist < W.reach + 0.25 && n.duelCd <= 0) { n.duelPhase = 'wind'; n.duelT = W.wind * Math.max(1, D.cd); SFX.whoosh(); }
+    if (dist > W.reach * 0.75) { n.duelFace = false; return [Math.min(3.4, 1.4 + dist * 0.35) * spd, ux, uz]; }
+    return [0, 0, 0];
+  }
+  // ranged: hold a preferred distance and strafe so it is harder to hit
+  n.strafeT -= dt;
+  if (n.strafeT <= 0) { n.strafeT = rand(1.2, 2.8); n.strafe = Math.random() < 0.25 ? 0 : Math.random() < 0.5 ? -1 : 1; }
+  let mx = -uz * n.strafe * 0.9, mz = ux * n.strafe * 0.9;
+  if (dist > W.range + 1) { mx += ux * 1.6; mz += uz * 1.6; }
+  else if (dist < W.range - 1.5) { mx -= ux * 1.4; mz -= uz * 1.4; }
+  if (W.flame) { if (dist < W.range + 1) duelFlame(n, dt); }
+  else if (n.duelCd <= 0 && dist < W.range * 1.8) { duelShoot(n); n.duelCd = W.cd * D.cd * rand(0.85, 1.2); }
+  const ml = Math.hypot(mx, mz);
+  return ml > 0.05 ? [Math.min(2.6, 1.1 + ml) * spd, mx / ml, mz / ml] : [0, 0, 0];
+}
+// Right arm pose: guard, wind-up, strike, or aim along the line to the player
+function duelArm(n, k) {
+  const s = n.s, T = n.parts.torso, W = duel.cur;
+  const t = playerTarget();
+  const d = V3(t.x - _sh.x, t.y - _sh.y, t.z - _sh.z).normalize();
+  const sh = V3(_sh.x, _sh.y, _sh.z), up = V3(0, 1, 0);
+  let lo, hi, kk = 45;
+  if (!duel.active || duel.over || !W) { lo = sh.clone().addScaledVector(up, -0.44 * s); hi = sh.clone().addScaledVector(up, -0.15 * s); kk = 30; }
+  else if (W.melee && n.duelPhase === 'wind') { lo = sh.clone().addScaledVector(up, 0.3 * s).addScaledVector(d, -0.12 * s); hi = sh.clone().addScaledVector(up, 0.12 * s).addScaledVector(d, -0.05 * s); kk = 70; }
+  else if (W.melee && n.duelPhase === 'strike') { lo = sh.clone().addScaledVector(d, 0.45 * s); hi = sh.clone().addScaledVector(d, 0.15 * s); kk = 110; }
+  else if (W.melee) { lo = sh.clone().addScaledVector(d, 0.3 * s).addScaledVector(up, 0.06 * s); hi = sh.clone().addScaledVector(d, 0.1 * s).addScaledVector(up, -0.08 * s); }
+  else { lo = sh.clone().addScaledVector(d, 0.45 * s); hi = sh.clone().addScaledVector(d, 0.15 * s); kk = 60; }
+  springTo(n.parts.lArmR, lo.x, lo.y, lo.z, kk, 7, T.velocity, k);
+  springTo(n.parts.uArmR, hi.x, hi.y, hi.z, kk, 7, T.velocity, k);
+}
+function duelMeleeStrike(n) {
+  const W = duel.cur, D = duelDiff(), T = n.parts.torso.position;
+  const d = Math.hypot(headPos.x - T.x, headPos.z - T.z);
+  const chance = 0.5 + D.acc * 0.55 - clamp(duel.headVel * 0.07, 0, 0.35); // backing off quickly helps
+  if (d < W.reach + 0.35 && Math.random() < chance) {
+    damagePlayer(W.dmg * D.dmg, V3(T.x, T.y, T.z), W.knock);
+    SFX.impact(9, headPos, W.name === 'Sword' ? 'metal' : 'flesh');
+    burst(playerTarget(), 0xb02020, 4);
+  } else SFX.whoosh();
+}
+function duelShoot(n) {
+  const W = duel.cur, D = duelDiff(), M = duelHand(n);
+  if (W.proj) return duelProjectile(n, M, W);
+  const fire1 = () => {
+    const T = playerTarget(), dir = T.clone().sub(M), dist = dir.length(); dir.normalize();
+    const block = castRay(M, dir, dist, n);
+    const blocked = block && M.distanceTo(block.point) < dist - 0.35; // cover works
+    const chance = D.acc * (W.acc ?? 1) * clamp(1.25 - dist / 22, 0.35, 1) * (1 - clamp(duel.headVel * 0.12, 0, 0.45));
+    let end;
+    if (blocked) { end = block.point; hitEnt(block, dir, { dmg: W.dmg, impulse: 6, bits: 3 }); }
+    else if (Math.random() < chance) { end = T.clone().add(V3(rand(-0.08, 0.08), rand(-0.08, 0.08), rand(-0.08, 0.08))); damagePlayer(W.dmg * D.dmg, M, 0.1); }
+    else {
+      const side = V3(rand(-1, 1), rand(-0.6, 1), rand(-1, 1)); side.addScaledVector(dir, -side.dot(dir)).normalize();
+      end = T.clone().addScaledVector(side, rand(0.45, 1.1)).addScaledVector(dir, 8);
+      const nd = end.clone().sub(M), nl = nd.length(); nd.normalize();
+      const after = castRay(M, nd, nl, n); if (after) end = after.point;
+    }
+    if (W.bolt) boltFX(M, end); else beamMesh(M, end, 0xffe2a0, 0.008, 0.06);
+  };
+  for (let i = 0; i < (W.pellets || 1); i++) fire1();
+  if (W.bolt) { SFX.zap(); flashAt(M, 0x88ccff, 6); }
+  else { SFX.shot(W.pellets ? 1 : W.name === 'SMG' ? 2 : 0); flashAt(M, 0xffc070, 6); }
+}
+function duelFlame(n, dt) {
+  const W = duel.cur, M = duelHand(n), T = playerTarget(), dir = T.clone().sub(M), d = dir.length(); dir.normalize();
+  if (Math.random() < 0.7) flameParticle(M.clone().addScaledVector(dir, 0.05), dir.clone().multiplyScalar(rand(6, 9)).add(V3(rand(-1, 1), rand(-1, 1), rand(-1, 1)).multiplyScalar(0.8)), rand(0.35, 0.55), 1.1);
+  if ((n.flameSnd = (n.flameSnd || 0) - dt) <= 0) { n.flameSnd = 0.12; SFX.flame(); }
+  if (d < W.range + 0.6) {
+    const block = castRay(M, dir, d, n);
+    if (!block || M.distanceTo(block.point) > d - 0.35) damagePlayer(W.dps * duelDiff().dmg * dt, null, 0);
+  }
+}
+function duelProjectile(n, M, W) {
+  const err = (1 - duelDiff().acc) * 1.3;
+  const dir = playerTarget().add(V3(rand(-err, err), rand(-err, err) * 0.5, rand(-err, err))).sub(M).normalize();
+  const mesh = W.proj === 'rocket' ? rocketMesh() : boltMesh();
+  mesh.position.copy(M); mesh.lookAt(M.clone().add(dir)); fxGroup.add(mesh);
+  duel.shots.push({ mesh, pos: M.clone(), vel: dir.multiplyScalar(W.speed), kind: W.proj, life: 5, owner: n, dmg: W.dmg || 0 });
+  if (W.proj === 'rocket') { SFX.rocket(); flashAt(M, 0xffa040, 10); } else SFX.twang();
+}
+function duelUpdateShots(dt) {
+  const D = duelDiff();
+  for (let i = duel.shots.length - 1; i >= 0; i--) {
+    const p = duel.shots[i]; p.life -= dt;
+    if (p.kind === 'bolt') p.vel.y -= 4 * dt;
+    const step = p.vel.clone().multiplyScalar(dt), len = step.length(), dir = step.clone().normalize();
+    const hit = castRay(p.pos, dir, len, p.owner);
+    const T = playerTarget(), tt = clamp(T.clone().sub(p.pos).dot(dir), 0, len);
+    const closest = p.pos.clone().addScaledVector(dir, tt);
+    const kill = () => { disposeMesh(p.mesh); duel.shots.splice(i, 1); };
+    if (!duel.over && closest.distanceTo(T) < 0.4 && (!hit || p.pos.distanceTo(hit.point) > tt)) {
+      if (p.kind === 'rocket') explode(closest, 4, 1, { duelMul: D.dmg });
+      else { damagePlayer(p.dmg * D.dmg, p.pos, 0.3); SFX.impact(10, headPos, 'flesh'); }
+      kill(); continue;
+    }
+    if (hit) {
+      if (p.kind === 'rocket') { explode(hit.point.clone().addScaledVector(dir, -0.2), 4, 1, { duelMul: D.dmg }); kill(); }
+      else {
+        hitEnt(hit, dir, { dmg: p.dmg, impulse: 10, bits: 3 });
+        p.mesh.position.copy(hit.point).addScaledVector(dir, -0.18);
+        duel.shots.splice(i, 1); if (!hit.balloon) stickMesh(p.mesh, hit); else disposeMesh(p.mesh);
+      }
+      continue;
+    }
+    if (p.life <= 0) { kill(); continue; }
+    p.pos.add(step); p.mesh.position.copy(p.pos); p.mesh.lookAt(p.pos.clone().add(p.vel));
+    if (p.kind === 'rocket' && Math.random() < 0.6) flameParticle(p.pos.clone(), p.vel.clone().multiplyScalar(-0.05), 0.25, 0.7);
+  }
+}
+// Explosions near the player hurt in a duel (yours too, so mind your rockets)
+function duelBlast(pos, radius, o) {
+  if (!duel.active || duel.over || o.dust) return;
+  const d = headPos.distanceTo(pos);
+  if (d < radius) damagePlayer(55 * (1 - d / radius) * (o.duelMul ?? 1), pos, 0.8);
+}
+
+// Health bar floating over the enemy
+function duelBarSprite() {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 120;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, toneMapped: false }));
+  sp.scale.set(0.8, 0.1875, 1); sp.renderOrder = 998; fxGroup.add(sp);
+  return { sp, c, tex, last: -1 };
+}
+function drawBar(g, x, y, w, h, f, col) {
+  g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(x, y, w, h);
+  g.fillStyle = col; g.fillRect(x + 3, y + 3, Math.max(0, (w - 6) * f), h - 6);
+  g.strokeStyle = 'rgba(255,255,255,.35)'; g.lineWidth = 2; g.strokeRect(x, y, w, h);
+}
+function duelUpdateBar() {
+  const n = duel.enemy, B = duel.bar; if (!B) return;
+  if (!n || n.removed) { B.sp.visible = false; return; }
+  const h = n.parts.head.interpolatedPosition;
+  B.sp.position.set(h.x, h.y + 0.38 * n.s, h.z); B.sp.visible = true;
+  const f = Math.max(0, n.health) / n.maxHealth;
+  if (Math.abs(f - B.last) < 0.002) return;
+  B.last = f;
+  const g = B.c.getContext('2d'); g.clearRect(0, 0, 512, 120);
+  g.font = '700 34px "Chakra Petch", sans-serif'; g.textAlign = 'center'; g.fillStyle = '#ffd7cf';
+  g.shadowColor = '#000'; g.shadowBlur = 6;
+  g.fillText(`DUELIST · ${duel.cur.name.toUpperCase()}`, 256, 40); g.shadowBlur = 0;
+  drawBar(g, 16, 58, 480, 44, f, f > 0.5 ? '#e8503a' : f > 0.25 ? '#ff8a3a' : '#ffcf3a');
+  B.tex.needsUpdate = true;
+}
+// Your own health: an on-screen panel on PC, a small panel low in your view in VR
+const duelHud = { c: document.createElement('canvas') };
+duelHud.c.width = 1200; duelHud.c.height = 180; duelHud.c.id = 'duelHud'; duelHud.c.hidden = true;
+document.body.appendChild(duelHud.c);
+duelHud.tex = new THREE.CanvasTexture(duelHud.c); duelHud.tex.colorSpace = THREE.SRGBColorSpace;
+duelHud.mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.045), new THREE.MeshBasicMaterial({ map: duelHud.tex, transparent: true, depthTest: false, toneMapped: false }));
+duelHud.mesh.position.set(0, -0.2, -0.6); duelHud.mesh.renderOrder = 1001; duelHud.mesh.visible = false; camera.add(duelHud.mesh);
+const duelFlashMesh = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 12), new THREE.MeshBasicMaterial({ color: 0xc01010, side: THREE.BackSide, transparent: true, opacity: 0, depthTest: false, depthWrite: false }));
+duelFlashMesh.renderOrder = 1000; duelFlashMesh.visible = false; camera.add(duelFlashMesh);
+function drawDuelHud() {
+  const g = duelHud.c.getContext('2d'), W = 1200, H = 180;
+  g.clearRect(0, 0, W, H);
+  rr(g, 4, 4, W - 8, H - 8, 22); g.fillStyle = 'rgba(14,19,27,.88)'; g.fill(); g.lineWidth = 3; g.strokeStyle = C.line; g.stroke();
+  const f = duel.hp / duel.maxHp;
+  g.textBaseline = 'middle'; g.textAlign = 'left';
+  g.font = '700 44px "Chakra Petch", sans-serif'; g.fillStyle = C.accent2; g.fillText('YOU', 30, 62);
+  drawBar(g, 150, 34, 860, 56, f, f > 0.5 ? '#36b37e' : f > 0.25 ? '#f2b134' : '#e8503a');
+  g.font = '700 44px "IBM Plex Sans", sans-serif'; g.fillStyle = C.fg; g.textAlign = 'right'; g.fillText(`${Math.ceil(duel.hp)}`, 1170, 62);
+  g.textAlign = 'left'; g.font = '600 34px "IBM Plex Sans", sans-serif'; g.fillStyle = C.muted;
+  const st = duel.over === 'win' ? 'YOU WIN' : duel.over === 'lose' ? 'KNOCKED OUT' : `vs ${duel.cur?.name ?? ''} · ${duelDiff().name}`;
+  g.fillText(`Round ${duel.round} · ${st} · Wins ${duel.wins} · Losses ${duel.losses}`, 30, 135);
+  duelHud.tex.needsUpdate = true;
+}
+function duelUpdate(dt) {
+  const hv = headPos.distanceTo(duel.lastHead) / Math.max(dt, 1e-3); duel.lastHead.copy(headPos);
+  duel.headVel = duel.headVel * 0.9 + Math.min(hv, 10) * 0.1;
+  duel.flash = Math.max(0, duel.flash - dt * 1.6);
+  const low = duel.active && !duel.over && duel.hp < 30 ? 0.1 + 0.06 * Math.sin(performance.now() / 180) : 0;
+  const op = Math.max(duel.flash * 0.45, low);
+  duelFlashMesh.visible = op > 0.01; duelFlashMesh.material.opacity = op;
+  const vr = renderer.xr.isPresenting;
+  duelHud.c.hidden = !duel.active || vr;
+  duelHud.mesh.visible = duel.active && vr;
+  if (!duel.active) return;
+  duelUpdateShots(dt);
+  const n = duel.enemy;
+  if (!duel.over && (!n || n.removed || n.state === 'dead')) duelOver('win');
+  duelUpdateBar();
+  if (duel.hudDirty) { duel.hudDirty = false; drawDuelHud(); }
+}
+function drawDuelPage() {
+  wrapText('Fight a ragdoll that fights back. Use any weapon, tool or prop, including weapons you drew. Duck behind objects to block its shots, and keep moving to make it miss.', 40, 180, 940);
+  const wn = duel.w >= DUEL_WEAPONS.length ? 'Random' : DUEL_WEAPONS[duel.w].name;
+  const nW = DUEL_WEAPONS.length + 1, mine = duelMyList();
+  if (duel.mine >= mine.length) duel.mine = 0;
+  stepper(256, 'Enemy weapon', wn, () => duel.w = cyc(duel.w, nW, -1), () => duel.w = cyc(duel.w, nW, 1));
+  stepper(326, 'Difficulty', DUEL_DIFF[duel.diff].name, () => duel.diff = cyc(duel.diff, DUEL_DIFF.length, -1), () => duel.diff = cyc(duel.diff, DUEL_DIFF.length, 1));
+  stepper(396, 'Your weapon', mine[duel.mine].name, () => duel.mine = cyc(duel.mine, mine.length, -1), () => duel.mine = cyc(duel.mine, mine.length, 1));
+  const D = DUEL_DIFF[duel.diff];
+  mlabel(612, 286, D.desc, { color: C.fg });
+  mlabel(612, 356, `Enemy health ${D.hp} · your health ${duel.maxHp}`);
+  mlabel(612, 426, `Wins ${duel.wins} · Losses ${duel.losses}`, { color: C.fg });
+  if (duel.over) mlabel(40, 488, duel.over === 'win' ? 'YOU WIN!' : 'YOU WERE KNOCKED OUT', { font: '700 34px "Chakra Petch", sans-serif', color: duel.over === 'win' ? C.accent2 : '#ff6a5a' });
+  else if (duel.active) mlabel(40, 488, `Round ${duel.round} in progress · your health ${Math.ceil(duel.hp)}`, { color: C.fg });
+  const y = 530;
+  if (!duel.active) mbtn(32, y, 600, 100, 'Start duel', () => duelStart(), { active: true, size: 34, sub: 'Removes the other NPCs on this map' });
+  else {
+    mbtn(32, y, 470, 100, duel.over ? 'Rematch' : 'Restart round', () => duelStart(), { active: true, size: 30 });
+    mbtn(522, y, 470, 100, 'Leave duel', () => duelEnd(), { size: 30 });
+  }
+}
+
+// ====================================================================
 //  Menu panel (canvas texture, works in VR on the left wrist and on desktop)
 // ====================================================================
 const MW = 1024, MH = 720;
@@ -2748,7 +3072,7 @@ function drawMenu() {
   g.fillStyle = C.fg; g.fillText('RAGDOLL', 32, 62); const w = g.measureText('RAGDOLL').width;
   g.fillStyle = C.accent; g.fillText('LAB', 32 + w + 6, 62);
   mlabel(MW - 32, 48, `${MAPS[state.map].name} · ${props.length} props · ${npcs.length} NPCs`, { align: 'right', font: '600 20px "IBM Plex Sans", sans-serif' });
-  const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['workshop', 'Workshop'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World']];
+  const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['workshop', 'Workshop'], ['duel', 'Duel'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World']];
   if (ws.active) {
     const si = WS_STEPS.indexOf(ws.step);
     WS_STEP_NAMES.forEach((n, i) => {
@@ -2756,9 +3080,10 @@ function drawMenu() {
       g.fillStyle = i === si ? C.accent : i < si ? '#24402f' : C.btn; g.fill();
       mlabel(x + 92, 117, `${i + 1}  ${n}`, { align: 'center', color: i === si ? '#1a1205' : C.fg, font: '700 22px "Chakra Petch", sans-serif' });
     });
-  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 137, 88, 129, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 21 }));
+  } else tabs.forEach(([id, name], i) => mbtn(32 + i * 120, 88, 114, 56, name, () => { menu.page = id; }, { active: menu.page === id, size: 20 }));
   const P = ws.active ? 'workshop' : menu.page;
   if (P === 'workshop') drawWorkshopPage();
+  if (P === 'duel') drawDuelPage();
   if (P === 'weapons') {
     WEAPONS.forEach((w, i) => mbtn(32 + (i % 3) * 323, 160 + Math.floor(i / 3) * 92, 313, 84, w.name, () => equipWeapon(i, menu.clickHand), { sub: w.sub, left: true, size: 24 }));
     wrapText('Picking a weapon puts it in your hand. VR: trigger fires, squeeze and let go to drop or throw. Desktop: left click fires, right click throws, F drops. Draw your own in the Workshop tab.', 40, 556, 940);
@@ -3313,6 +3638,7 @@ renderer.setAnimationLoop(() => {
   wsUpdate(dt);
   updateWeapons(dt);
   updateProjectiles(dt);
+  duelUpdate(dt);
   for (const n of npcs.slice()) npcThink(n, dt);
   if (!state.paused) world.step(FIXED, dt * TIMES[state.time].s, 5);
   while (queue.length) queue.shift()();
@@ -3340,5 +3666,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, rig, woundNPC, hitEnt, gibs, splats, camera };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, rig, woundNPC, hitEnt, gibs, splats, camera };
 </script>
