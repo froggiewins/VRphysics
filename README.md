@@ -46,7 +46,11 @@ Built with three.js and cannon-es, loaded from the jsDelivr CDN. No build step.
 
 ## Models
 
-The 12 weapons, the rocket, the barrel and the bomb are modelled in Blender and loaded from `models/ragdoll-lab.glb`. If that file is missing, the game falls back to simple built-in shapes. The models are made by a script, so to change them, edit `blender/build_models.py` and run:
+The ragdolls, weapons, props and map set pieces are modelled in Blender and loaded from `models/ragdoll-lab.glb`. If that file is missing, the game falls back to simple built-in shapes.
+
+- **Ragdolls** are one skinned mesh (shirt, trousers, skin and shoes) with an armature of 10 bones, one per physics body part. Each bone follows its part and is scaled to the ragdoll's body shape, so the Ragdoll Maker still works. The old box parts stay as invisible stand-ins that take hits and carry the face, hats, drawings and organs. Wounds are mapped onto the skinned mesh.
+- **Props:** crate, cardboard box, plank, steel block, domino, brick, block, cart and wheels, melon, barrel, bomb, bowling pin and ball, curling stone.
+- **Maps:** pine trees (plain and snowy), rocks, the weapon table, warehouse racks and lamps, the moon dome, airlock and crater rims, and the stunt park half-pipe. Their physics shapes are unchanged and invisible under the models. The models are made by a script, so to change them, edit `blender/build_models.py` and run:
 
 ```
 blender --background --factory-startup --python blender/build_models.py -- models/ragdoll-lab.glb blender/preview.png

@@ -429,8 +429,400 @@ def bomb():
     finish(lathe([(0.0, 0.3), (0.05, 0.3), (0.062, 0.292), (0.07, 0.275), (0.07, 0.2), (0.0, 0.2)], 24), 'Bomb_Cap', GUND, rot=(-PI / 2, 0, 0), smooth=40)
     finish(torus(0.07, 0.006, 24, 8), 'Bomb_CapRing', GUN, (0, 0.235, 0), (PI / 2, 0, 0))
 
-for f in (pistol, shotgun, smg, rocket_launcher, rocket, grenade, crossbow, sword, bat, sledgehammer, flamethrower, lightning_gun, freeze_ray, barrel, bomb):
+# ---------------------------------------------------------------- ragdoll: one skinned mesh + armature
+# Modelled on the default 1.8 m figure (the game's npcLayout() with no body changes). One bone per
+# physics part; the game moves each bone with its part and scales it to the ragdoll's body shape.
+RAG_PARTS = {  # part: centre (x, y) in metres, from npcLayout()
+    'torso': (0, 1.18), 'head': (0, 1.595), 'uArmL': (-0.24, 1.29), 'lArmL': (-0.24, 0.985), 'uArmR': (0.24, 1.29), 'lArmR': (0.24, 0.985),
+    'uLegL': (-0.09, 0.672), 'lLegL': (-0.09, 0.225), 'uLegR': (0.09, 0.672), 'lLegR': (0.09, 0.225),
+}
+def ss(a, b, x):  # smoothstep from a (0) to b (1); a may be greater than b
+    t = max(0.0, min(1.0, (x - a) / (b - a))); return t * t * (3 - 2 * t)
+
+def ring_se(cx, cy, cz, hx, hz, n=28, e=2.6):  # superellipse ring in the XZ plane at height cy
+    out = []
+    for k in range(n):
+        a = 2 * PI * k / n; c, s_ = math.cos(a), math.sin(a)
+        out.append((cx + hx * math.copysign(abs(c) ** (2 / e), c), cy, cz + hz * math.copysign(abs(s_) ** (2 / e), s_)))
+    return out
+
+def loft(rings, cap=True):
+    bm = bmesh.new(); R = [[bm.verts.new(p) for p in r] for r in rings]; n = len(rings[0])
+    for i in range(len(R) - 1):
+        for k in range(n): bm.faces.new((R[i][k], R[i][(k + 1) % n], R[i + 1][(k + 1) % n], R[i + 1][k]))
+    if cap:
+        for r in (R[0], R[-1]):
+            c = bm.verts.new(sum((v.co for v in r), Vector()) / n)
+            for k in range(n): bm.faces.new((r[k], r[(k + 1) % n], c))
+    return bm
+
+def lathe_y(prof, cx, cz, segs=20):  # spin (radius, y) around a vertical axis through (cx, cz)
+    return loft([[(cx + r * math.cos(2 * PI * k / segs), y, cz + r * math.sin(2 * PI * k / segs)) for k in range(segs)] for r, y in prof], cap=False)
+
+def ragdoll():
+    global CUR
+    mats = [mat('R_Shirt', 0x2f7fe0, 0.0, 0.8), mat('R_Pants', 0x2b3a55, 0.0, 0.85), mat('R_Skin', 0xf1c7a5, 0.0, 0.7), mat('R_Shoes', 0x1b1b1b, 0.0, 0.6)]
+    SH, PA, SK, SO = range(4)
+    master = bmesh.new(); weights = []
+    def add(bm, wfn, mi=None, mfn=None):
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        vmap = {}
+        for v in bm.verts:
+            p = v.co.copy(); vmap[v] = master.verts.new(C @ p); weights.append(wfn(p))
+        for f in bm.faces:
+            nf = master.faces.new([vmap[v] for v in f.verts]); nf.smooth = True
+            nf.material_index = mfn(sum((v.co for v in f.verts), Vector()) / len(f.verts)) if mfn else mi
+        bm.free()
+    one = lambda part: (lambda p: {part: 1.0})
+    def blend(main, other, w):
+        w = max(0.0, min(1.0, w)); return {main: 1 - w, other: w} if w > 1e-4 else {main: 1.0}
+    # torso: shirt on top, trousers round the hips
+    secs = [(0.905, 0.15, 0.085, 0), (0.92, 0.168, 0.095, 0), (0.98, 0.168, 0.095, 0), (1.05, 0.152, 0.088, 0), (1.15, 0.165, 0.095, 0.005),
+            (1.25, 0.176, 0.1, 0.008), (1.35, 0.18, 0.098, 0.004), (1.41, 0.175, 0.09, 0), (1.445, 0.15, 0.075, 0), (1.465, 0.09, 0.055, -0.005)]
+    add(loft([ring_se(0, y, z, hx, hz, 32) for y, hx, hz, z in secs]), one('torso'), mfn=lambda c: PA if c.y < 0.975 else SH)
+    # neck, stretching between torso and head
+    add(lathe_y([(0.0, 1.43), (0.046, 1.43), (0.045, 1.48), (0.043, 1.53), (0.0, 1.53)], 0, -0.005, 16), lambda p: blend('torso', 'head', ss(1.465, 1.5, p.y)), SK)
+    # head with ears and a nose (the game adds the face, hair and hats)
+    add(_moved(sphere(0.12, 32, 20), (0, 1.595, 0)), one('head'), SK)
+    for sx in (-1, 1):
+        e = sphere(0.03, 12, 8); bmesh.ops.scale(e, vec=(0.45, 1, 0.75), verts=e.verts)
+        add(_moved(e, (sx * 0.118, 1.585, -0.005)), one('head'), SK)
+    add(_moved(sphere(0.016, 12, 8), (0, 1.578, 0.115)), one('head'), SK)
+    for sx, s in ((-1, 'L'), (1, 'R')):
+        x = sx * 0.24
+        # upper arm (sleeve) with a rounded shoulder, blending into the torso and the forearm
+        add(lathe_y([(0, 1.465), (0.03, 1.457), (0.045, 1.44), (0.052, 1.41), (0.05, 1.3), (0.047, 1.2), (0.045, 1.14), (0.035, 1.12), (0, 1.115)], x, 0),
+            lambda p, s=s: blend('uArm' + s, 'torso', 0.5 * ss(1.40, 1.46, p.y)) if p.y > 1.3 else blend('uArm' + s, 'lArm' + s, 0.5 * ss(1.17, 1.12, p.y)), SH)
+        # forearm and hand
+        add(lathe_y([(0, 1.155), (0.03, 1.152), (0.043, 1.14), (0.042, 1.05), (0.036, 0.88), (0.03, 0.85), (0, 0.845)], x, 0),
+            lambda p, s=s: blend('lArm' + s, 'uArm' + s, 0.5 * ss(1.11, 1.15, p.y)), SK)
+        hand = [(0.845, 0.016, 0.03), (0.82, 0.019, 0.036), (0.78, 0.018, 0.035), (0.755, 0.014, 0.028), (0.745, 0.006, 0.015)]
+        add(loft([ring_se(x, y, 0.005, hx, hz, 16) for y, hx, hz in hand]), one('lArm' + s), SK)
+        add(sweep([(x - sx * 0.006, 0.82, 0.03), (x - sx * 0.008, 0.8, 0.045), (x - sx * 0.008, 0.785, 0.05)], [0.009, 0.008, 0.007], m=8), one('lArm' + s), SK)
+        # thigh and shin (trousers)
+        lx = sx * 0.09
+        add(lathe_y([(0, 0.94), (0.05, 0.935), (0.07, 0.91), (0.074, 0.86), (0.068, 0.7), (0.06, 0.5), (0.057, 0.46), (0.045, 0.44), (0, 0.435)], lx, 0, 22),
+            lambda p, s=s: blend('uLeg' + s, 'torso', 0.6 * ss(0.86, 0.93, p.y)) if p.y > 0.7 else blend('uLeg' + s, 'lLeg' + s, 0.5 * ss(0.48, 0.43, p.y)), PA)
+        add(lathe_y([(0, 0.475), (0.045, 0.47), (0.058, 0.455), (0.058, 0.38), (0.052, 0.25), (0.044, 0.12), (0.042, 0.07), (0, 0.06)], lx, 0, 22),
+            lambda p, s=s: blend('lLeg' + s, 'uLeg' + s, 0.5 * ss(0.42, 0.47, p.y)), PA)
+        # shoe
+        shoe = [(-0.075, 0.035, 0.05, 0.028), (-0.06, 0.035, 0.058, 0.036), (0.0, 0.035, 0.06, 0.037), (0.07, 0.03, 0.062, 0.03),
+                (0.12, 0.026, 0.055, 0.024), (0.15, 0.024, 0.04, 0.017), (0.158, 0.024, 0.02, 0.01)]
+        rings = []
+        for z, cy, hx, hy in shoe:
+            r = []
+            for k in range(20):
+                a = 2 * PI * k / 20; c, s_ = math.cos(a), math.sin(a)
+                r.append((lx + hx * math.copysign(abs(c) ** (2 / 3), c), cy + hy * math.copysign(abs(s_) ** (2 / 3), s_), z + 0.0))
+            rings.append(r)
+        add(loft(rings), one('lLeg' + s), SO)
+    me = bpy.data.meshes.new('R_BodyMesh'); master.to_mesh(me); master.free()
+    for m in mats: me.materials.append(m)
+    # armature: one bone per physics part, pointing up through the part's centre
+    arm_data = bpy.data.armatures.new('R_Armature'); arm = bpy.data.objects.new('R_Ragdoll', arm_data); COLL.objects.link(arm)
+    bpy.context.view_layer.objects.active = arm; arm.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    for name, (x, y) in RAG_PARTS.items():
+        b = arm_data.edit_bones.new(name); b.head = C @ Vector((x, y, 0)); b.tail = C @ Vector((x, y + 0.06, 0))
+    bpy.ops.object.mode_set(mode='OBJECT')
+    ob = bpy.data.objects.new('R_BodyMesh', me); COLL.objects.link(ob); ob.parent = arm
+    groups = {name: ob.vertex_groups.new(name=name) for name in RAG_PARTS}
+    for i, w in enumerate(weights):
+        for part, val in w.items(): groups[part].add([i], val, 'REPLACE')
+    md = ob.modifiers.new('Armature', 'ARMATURE'); md.object = arm
+    me.set_sharp_from_angle(angle=math.radians(60))
+    CUR = None
+
+def _moved(bm, pos):
+    bmesh.ops.translate(bm, vec=pos, verts=bm.verts); return bm
+
+# ---------------------------------------------------------------- props
+# Each prop: a '<Name>_Body' mesh that becomes the prop's own (paintable) mesh, sized exactly like its
+# physics shape, plus trim pieces with their own materials. Centred on the physics centre.
+BODY = mat('PropBody', 0xc39056, 0.0, 0.7)  # placeholder: the game keeps each prop's own material
+CRATE_DARK = mat('CrateFrame', 0x7a4f26, 0.0, 0.75)
+TAPE = mat('Tape', 0xd8c08a, 0.0, 0.4)
+BOLT = mat('Bolt', 0x3a4048, 0.8, 0.35)
+PIP = mat('Pip', 0x111111, 0.0, 0.4)
+RUBBER = mat('Rubber', 0x1a1a1a, 0.0, 0.9)
+HUBM = mat('Hub', 0xffb020, 0.4, 0.4)
+MELON_DARK = mat('MelonStripe', 0x24561f, 0.0, 0.55)
+STEM = mat('Stem', 0x6b4a2e, 0.0, 0.8)
+PIN_RED = mat('PinStripe', 0xc0392b, 0.1, 0.35)
+GRANITE = mat('Granite', 0x8b8f94, 0.05, 0.6)
+GRANITE_D = mat('GraniteBand', 0x4c5056, 0.05, 0.5)
+
+def crate():
+    model('P_Crate')
+    finish(box(0.47, 0.47, 0.47), 'Crate_Body', BODY, bevel=0.004)
+    e = 0.22
+    for ax in range(3):  # twelve edge beams
+        for a in (-e, e):
+            for b in (-e, e):
+                size = [0.06, 0.06, 0.06]; size[ax] = 0.5
+                pos = {0: (0, a, b), 1: (a, 0, b), 2: (a, b, 0)}[ax]
+                finish(box(*size), f'Crate_Edge{ax}{a}{b}', CRATE_DARK, pos, bevel=0.006)
+    for sg in (-1, 1):  # a diagonal brace on every face
+        finish(box(0.055, 0.54, 0.022), f'Crate_BraceZ{sg}', CRATE_DARK, (0, 0, sg * 0.24), (0, 0, sg * PI / 4), bevel=0.004)
+        finish(box(0.022, 0.54, 0.055), f'Crate_BraceX{sg}', CRATE_DARK, (sg * 0.24, 0, 0), (sg * PI / 4, 0, 0), bevel=0.004)
+        finish(box(0.54, 0.022, 0.055), f'Crate_BraceY{sg}', CRATE_DARK, (0, sg * 0.24, 0), (0, sg * PI / 4, 0), bevel=0.004)
+
+def small_box():
+    model('P_SmallBox')
+    finish(box(0.25, 0.25, 0.25), 'SmallBox_Body', BODY, bevel=0.008)
+    finish(box(0.06, 0.004, 0.252), 'SmallBox_TapeTop', TAPE, (0, 0.1255, 0), smooth=None)
+    for z in (-1, 1):
+        finish(box(0.06, 0.07, 0.004), f'SmallBox_Tape{z}', TAPE, (0, 0.09, z * 0.1255), smooth=None)
+    finish(box(0.002, 0.003, 0.25), 'SmallBox_Seam', BOLT, (0, 0.1262, 0), smooth=None)
+
+def plank():
+    model('P_Plank'); finish(box(0.35, 0.08, 2.2), 'Plank_Body', BODY, bevel=0.01)
+
+def block():
+    model('P_Block'); finish(box(0.2, 0.2, 0.6), 'Block_Body', BODY, bevel=0.008)
+
+def brick():
+    model('P_Brick'); finish(box(0.5, 0.25, 0.25), 'Brick_Body', BODY, bevel=0.012)
+
+def steel_block():
+    model('P_SteelBlock')
+    finish(box(0.6, 0.6, 0.6), 'SteelBlock_Body', BODY, bevel=0.02, segs=3)
+    k = 0
+    for ax in range(3):
+        for sgn in (-1, 1):
+            for a in (-0.23, 0.23):
+                for b in (-0.23, 0.23):
+                    pos = [a, b]; pos.insert(ax, sgn * 0.301)
+                    rot = [(0, PI / 2, 0), (-PI / 2, 0, 0), (0, 0, 0)][ax]
+                    finish(cyl(0.022, 0.022, 0.012, 6), f'SteelBlock_Bolt{k}', BOLT, tuple(pos), rot, bevel=0.002); k += 1
+
+def domino():
+    model('P_Domino')
+    finish(box(0.28, 0.5, 0.07), 'Domino_Body', BODY, bevel=0.018, segs=3)
+    pips = {3: [(-0.07, 0.07), (0, 0.125), (0.07, 0.18)], 5: [(-0.07, -0.07), (0.07, -0.07), (0, -0.125), (-0.07, -0.18), (0.07, -0.18)]}
+    k = 0
+    for zs in (-1, 1):
+        finish(box(0.2, 0.008, 0.004), f'Domino_Line{zs}', PIP, (0, 0, zs * 0.0352), smooth=None)
+        for (x, y) in pips[3] + pips[5]:
+            e = sphere(0.022, 10, 5); bmesh.ops.scale(e, vec=(1, 1, 0.25), verts=e.verts)
+            finish(e, f'Domino_Pip{k}', PIP, (x, y, zs * 0.034)); k += 1
+
+def cart():
+    model('P_CartBed')
+    finish(box(1.0, 0.18, 1.5), 'CartBed_Body', BODY, bevel=0.012)
+    for x in (-1, 1):
+        finish(box(0.06, 0.16, 1.5), f'CartBed_Rail{x}', CRATE_DARK, (x * 0.47, 0.17, 0), bevel=0.008)
+    for z in (-1, 1):
+        finish(box(0.88, 0.16, 0.06), f'CartBed_End{z}', CRATE_DARK, (0, 0.17, z * 0.72), bevel=0.008)
+    for x in (-1, 1):
+        finish(box(0.02, 0.12, 0.04), f'CartBed_Bracket{x}', BOLT, (x * 0.51, -0.06, 0.55), smooth=None)
+        finish(box(0.02, 0.12, 0.04), f'CartBed_BracketB{x}', BOLT, (x * 0.51, -0.06, -0.55), smooth=None)
+        rod(f'CartBed_Arm{x}', BOLT, (x * 0.3, 0.15, -0.75), (x * 0.25, 0.4, -1.15), 0.018)
+    rod('CartBed_Handle', RUBBER, (-0.3, 0.4, -1.15), (0.3, 0.4, -1.15), 0.024, 12)
+
+def wheel():
+    model('P_Wheel')
+    t = torus(0.172, 0.048, 36, 12); bmesh.ops.scale(t, vec=(1, 1, 1.25), verts=t.verts)
+    finish(t, 'Wheel_Body', BODY, rot=(0, PI / 2, 0))
+    finish(cyl(0.13, 0.13, 0.07, 24), 'Wheel_Rim', HUBM, rot=(0, PI / 2, 0), bevel=0.006)
+    finish(cyl(0.045, 0.045, 0.13, 12), 'Wheel_Hub', BOLT, rot=(0, PI / 2, 0), bevel=0.004)
+
+def melon():
+    model('P_Melon')
+    m = sphere(0.18, 28, 18); bmesh.ops.scale(m, vec=(1, 0.94, 1), verts=m.verts)
+    finish(m, 'Melon_Body', BODY, smooth=60)
+    for k in range(10):
+        a = 2 * PI * k / 10
+        pts = [(0.1815 * math.sin(t) * math.cos(a), 0.94 * 0.1815 * math.cos(t), 0.1815 * math.sin(t) * math.sin(a)) for t in [0.15 + (PI - 0.3) * i / 14 for i in range(15)]]
+        finish(sweep(pts, [(0.016, 0.003)] * 15, m=6, up=(math.cos(a), 0, math.sin(a))), f'Melon_Stripe{k}', MELON_DARK, smooth=60)
+    finish(cyl(0.008, 0.005, 0.03, 8), 'Melon_Stem', STEM, (0, 0.175, 0), (-PI / 2, 0, 0))
+
+def pin():
+    model('P_Pin')
+    prof = [(0.0, -0.225), (0.034, -0.225), (0.05, -0.17), (0.061, -0.09), (0.056, -0.02), (0.04, 0.05), (0.027, 0.1), (0.031, 0.14), (0.036, 0.17), (0.03, 0.205), (0.015, 0.222), (0.0, 0.225)]
+    finish(lathe_y(prof, 0, 0, 24), 'Pin_Body', BODY, smooth=60)
+    for y, r in ((0.075, 0.0345), (0.09, 0.0305)):
+        finish(lathe_y([(r, y - 0.005), (r, y + 0.005)], 0, 0, 24), f'Pin_Stripe{y}', PIN_RED)
+
+def bowling_ball():
+    model('P_BowlingBall')
+    for k, (th, ph) in enumerate(((0.35, 0.0), (0.55, 0.35), (0.55, -0.35))):
+        n = Vector((math.sin(th) * math.sin(ph), math.cos(th), math.sin(th) * math.cos(ph)))
+        q = Vector((0, 0, 1)).rotation_difference(n).to_euler('XYZ')
+        finish(cyl(0.017 if k else 0.02, 0.017 if k else 0.02, 0.012, 14), f'BowlingBall_Hole{k}', BLACK, tuple(n * 0.197), tuple(q))
+
+def curling():
+    model('P_Curling')
+    sweep_pts = [(0, 0.11, 0.06), (0, 0.17, 0.06), (0, 0.19, 0.03), (0, 0.192, -0.02), (0, 0.192, -0.14)]
+    finish(sweep(sweep_pts, [0.018] * 5, m=12), 'Curling_Body', BODY)
+    finish(lathe_y([(0.0, -0.11), (0.2, -0.11), (0.25, -0.095), (0.275, -0.06), (0.28, -0.02), (0.275, 0.04), (0.25, 0.08), (0.2, 0.105), (0.0, 0.11)], 0, 0, 36), 'Curling_Stone', GRANITE, smooth=50)
+    finish(lathe_y([(0.2805, -0.035), (0.2805, 0.005)], 0, 0, 36), 'Curling_Band', GRANITE_D)
+    finish(cyl(0.03, 0.03, 0.03, 12), 'Curling_Bolt', BOLT, (0, 0.115, 0.06), (-PI / 2, 0, 0))
+
+# ---------------------------------------------------------------- map pieces (origin noted per piece)
+BARK = mat('Bark', 0x6b4a2e, 0.0, 0.9)
+NEEDLES = mat('Needles', 0x2f7a3a, 0.0, 0.85)
+NEEDLES_D = mat('NeedlesDark', 0x2f5e4a, 0.0, 0.85)
+SNOW = mat('Snow', 0xf4f8ff, 0.0, 0.95)
+ROCK = mat('Rock', 0x8d8f8a, 0.0, 0.9)
+TABLE_TOP = mat('TableTop', 0xa0784c, 0.0, 0.6)
+TABLE_LEG = mat('TableLeg', 0x6e4c2b, 0.0, 0.7)
+RACK_POST = mat('RackPost', 0xd9822b, 0.3, 0.5)
+RACK_BEAM = mat('RackBeam', 0xc2452d, 0.3, 0.5)
+RACK_DECK = mat('RackDeck', 0x6b7480, 0.7, 0.4)
+LAMP_SHADE = mat('LampShade', 0x2f4a3a, 0.4, 0.5)
+BULB = mat('Bulb', 0xfff2cc, 0.0, 0.3, 0xffe2b0, 6.0)
+DOME = mat('DomePanel', 0xd8dde3, 0.2, 0.45)
+DOME_RIB = mat('DomeRib', 0x7c8590, 0.8, 0.35)
+GLASS = mat('DomeGlass', 0x16314d, 0.6, 0.1, 0x0b2a4a, 0.6)
+CONCRETE = mat('Concrete', 0x9a9ea3, 0.0, 0.9)
+HAZARD = mat('Hazard', 0xf2c230, 0.1, 0.5)
+MOON = mat('MoonRock', 0x7d7d7d, 0.0, 0.95)
+PIPE_BLUE = mat('HalfPipe', 0x5b8bd9, 0.1, 0.55)
+PIPE_SIDE = mat('HalfPipeSide', 0x3f69ad, 0.1, 0.65)
+
+def foliage_tier(R, base, h, lobes=9, seed=0):
+    bm = bmesh.new(); n = lobes * 4
+    rim = [bm.verts.new((R * (1 + 0.14 * math.sin(lobes * 2 * PI * k / n + seed)) * math.cos(2 * PI * k / n),
+                         base - 0.18 * (1 + math.sin(lobes * 2 * PI * k / n + seed)) / 2,
+                         R * (1 + 0.14 * math.sin(lobes * 2 * PI * k / n + seed)) * math.sin(2 * PI * k / n))) for k in range(n)]
+    mid = [bm.verts.new((0.55 * R * math.cos(2 * PI * (k + 0.5) / n), base + 0.45 * h, 0.55 * R * math.sin(2 * PI * (k + 0.5) / n))) for k in range(n)]
+    top = bm.verts.new((0, base + h, 0)); under = bm.verts.new((0, base + 0.12, 0))
+    for k in range(n):
+        bm.faces.new((rim[k], rim[(k + 1) % n], mid[k])); bm.faces.new((mid[k], rim[(k + 1) % n], mid[(k + 1) % n]))
+        bm.faces.new((mid[k], mid[(k + 1) % n], top)); bm.faces.new((rim[(k + 1) % n], rim[k], under))
+    return bm
+
+def pine(name, snowy):
+    model(name)  # origin on the ground at the trunk; scale 1 = the game's tree(s = 1)
+    finish(lathe_y([(0.0, 0.0), (0.24, 0.0), (0.2, 0.6), (0.17, 2.0), (0.12, 3.6), (0.0, 3.8)], 0, 0, 10), name + '_Trunk', BARK, smooth=50)
+    for i in range(3):
+        R = 1.6 - i * 0.4
+        finish(foliage_tier(R, 1.5 + i * 1.0, 1.8, 9, i * 1.3), f'{name}_Tier{i}', NEEDLES_D if snowy else NEEDLES, smooth=None)
+        if snowy:
+            finish(foliage_tier(R * 0.5, 2.6 + i * 1.0, 0.72, 9, i * 1.3), f'{name}_Snow{i}', SNOW, smooth=None)
+
+def rock(name, seed):
+    model(name)  # radius 1, centred
+    bm = bmesh.new(); bmesh.ops.create_icosphere(bm, subdivisions=3, radius=1.0)
+    for v in bm.verts:
+        x, y, z = v.co
+        d = 1 + 0.16 * math.sin(3.1 * x + seed) * math.cos(2.3 * z - seed) + 0.1 * math.sin(5.7 * y + 2 * seed) + 0.06 * math.cos(7.3 * x + 4.1 * z + seed)
+        v.co = Vector((x * d, y * d * 0.85, z * d))
+    finish(bm, name + '_Body', ROCK, smooth=None)
+
+def table():
+    model('M_Table')  # centred on the 2.6 x 0.8 x 1.2 physics box
+    finish(box(2.6, 0.08, 1.2), 'Table_Top', TABLE_TOP, (0, 0.36, 0), bevel=0.012)
+    for x in (-1.2, 1.2):
+        for z in (-0.5, 0.5):
+            finish(box(0.1, 0.72, 0.1), f'Table_Leg{x}{z}', TABLE_LEG, (x, -0.04, z), bevel=0.008)
+    for z in (-0.52, 0.52):
+        finish(box(2.3, 0.1, 0.04), f'Table_Apron{z}', TABLE_LEG, (0, 0.27, z), bevel=0.005)
+    finish(box(2.3, 0.05, 0.05), 'Table_Stretcher', TABLE_LEG, (0, -0.25, 0), bevel=0.005)
+    for x in (-1.2, 1.2):
+        finish(box(0.05, 0.05, 0.95), f'Table_Side{x}', TABLE_LEG, (x, -0.25, 0), bevel=0.005)
+
+def rack():
+    model('M_Rack')  # origin on the floor at the rack's centre (posts at x +-2.4, z +-0.6; shelves at 1.1, 2.3, 3.5)
+    for x in (-2.4, 2.4):
+        for z in (-0.6, 0.6):
+            finish(box(0.12, 4.2, 0.12), f'Rack_Post{x}{z}', RACK_POST, (x, 2.1, z), bevel=0.006)
+            for i in range(20):
+                finish(box(0.004, 0.035, 0.03), f'Rack_Hole{x}{z}{i}', BLACK, (x + (0.061 if x > 0 else -0.061), 0.4 + i * 0.19, z), smooth=None)
+        for y0, y1 in ((0.3, 1.0), (1.2, 2.2), (2.4, 3.4)):  # side bracing
+            rod(f'Rack_Brace{x}{y0}', RACK_POST, (x, y0, -0.55), (x, y1, 0.55), 0.018, 6)
+            rod(f'Rack_BraceB{x}{y0}', RACK_POST, (x, y0, 0.55), (x, y1, -0.55), 0.018, 6)
+    for h in (1.1, 2.3, 3.5):
+        for z in (-0.64, 0.64):
+            finish(box(4.68, 0.12, 0.06), f'Rack_Beam{h}{z}', RACK_BEAM, (0, h - 0.01, z), bevel=0.006)
+        finish(box(4.7, 0.03, 1.3), f'Rack_Deck{h}', RACK_DECK, (0, h + 0.035, 0), bevel=0.004)
+        for i in range(12):
+            finish(box(0.02, 0.025, 1.24), f'Rack_Wire{h}{i}', RACK_DECK, (-2.2 + i * 0.4, h + 0.008, 0), smooth=None)
+
+def lamp():
+    model('M_Lamp')  # origin at the bulb
+    rod('Lamp_Cable', RUBBER, (0, 0.2, 0), (0, 1.6, 0), 0.01, 6)
+    finish(lathe_y([(0.03, 0.22), (0.08, 0.2), (0.32, -0.02), (0.36, -0.06), (0.35, -0.07), (0.3, -0.03), (0.07, 0.18), (0.0, 0.19)], 0, 0, 24), 'Lamp_Shade', LAMP_SHADE)
+    finish(sphere(0.09, 16, 10), 'Lamp_Bulb', BULB, (0, 0.03, 0))
+
+def dome():
+    model('M_Dome')  # origin at the sphere centre; the ground is at y = 0.8 (the game sinks it 0.8 m)
+    R = 5.0; ys = [0.8 + (R - 0.8) * (1 - math.cos(PI / 2 * i / 16)) for i in range(17)]
+    finish(lathe_y([(math.sqrt(max(0.0, R * R - y * y)), y) for y in ys], 0, 0, 48), 'Dome_Shell', DOME, smooth=50)
+    for k in range(16):  # ribs
+        a = 2 * PI * k / 16
+        pts = [((R + 0.03) * math.sqrt(max(0.0, 1 - (y / R) ** 2)) * math.cos(a), y, (R + 0.03) * math.sqrt(max(0.0, 1 - (y / R) ** 2)) * math.sin(a)) for y in ys]
+        finish(sweep(pts, [0.06] * len(pts), m=6), f'Dome_Rib{k}', DOME_RIB)
+    for y in (2.0, 3.4, 4.4):  # rings
+        r = math.sqrt(R * R - y * y) + 0.03
+        finish(torus(r, 0.05, 64, 6), f'Dome_Ring{y}', DOME_RIB, (0, y, 0), (PI / 2, 0, 0))
+    yb = [2.15 + 1.1 * i / 4 for i in range(5)]  # window band
+    finish(lathe_y([(math.sqrt(R * R - y * y) + 0.012, y) for y in yb], 0, 0, 48), 'Dome_Windows', GLASS, smooth=50)
+    finish(torus(math.sqrt(R * R - 0.81) + 0.05, 0.18, 64, 8), 'Dome_Base', CONCRETE, (0, 0.85, 0), (PI / 2, 0, 0))
+
+def airlock():
+    model('M_Airlock')  # centred on the 1.6 x 2.2 x 0.4 physics box
+    finish(box(1.3, 2.0, 0.3), 'Airlock_Door', DOME, (0, -0.05, 0.05), bevel=0.02)
+    finish(box(0.02, 1.95, 0.32), 'Airlock_Seam', BLACK, (0, -0.05, 0.05), smooth=None)
+    for x in (-0.75, 0.75):
+        finish(box(0.15, 2.3, 0.45), f'Airlock_Jamb{x}', DOME_RIB, (x, 0.0, 0), bevel=0.015)
+    finish(box(1.65, 0.18, 0.45), 'Airlock_Lintel', DOME_RIB, (0, 1.1, 0), bevel=0.015)
+    for i in range(6):
+        finish(box(0.12, 0.06, 0.02), f'Airlock_Stripe{i}', HAZARD if i % 2 == 0 else BLACK, (-0.33 + i * 0.13, 1.1, 0.23), smooth=None)
+    finish(cyl(0.12, 0.12, 0.33, 24), 'Airlock_Window', GLASS, (0, 0.5, 0.05))
+    finish(torus(0.12, 0.02, 24, 8), 'Airlock_WindowRim', DOME_RIB, (0, 0.5, 0.215))
+    finish(sphere(0.04, 12, 8), 'Airlock_Light', mat('AirlockLight', 0xff4030, 0.0, 0.3, 0xff2010, 5.0), (0.75, 1.25, 0.24))
+
+def crater(rad):
+    name = f'M_Crater{rad}'; model(name)  # origin at the crater centre on the ground
+    prof = [(rad - 1.6, -0.12), (rad - 1.5, -0.085), (rad + 1.5, 0.86), (rad + 1.85, 0.8), (rad + 2.3, 0.35), (rad + 2.7, 0.0), (rad + 2.7, -0.12)]
+    segs = max(48, int(rad * 10))
+    bm = lathe_y(prof + [prof[0]], 0, 0, segs)
+    for v in bm.verts:  # lumpy rim
+        x, y, z = v.co; a = math.atan2(z, x)
+        if y > 0.0: v.co.y = y * (1 + 0.12 * math.sin(5 * a + rad) + 0.06 * math.sin(13 * a))
+    finish(bm, name + '_Rim', MOON, smooth=40)
+
+def half_pipe():
+    model('M_HalfPipe')  # origin on the ground at the half-pipe's centre; runs 14 m along z
+    pts = [(-7.6, 0.0), (-7.6, 5.1), (-6.85, 5.1)]
+    for i in range(1, 25):
+        th = PI / 2 * (1 - i / 24); pts.append((-(2 + 4.85 * math.sin(th)), 5.05 - 4.85 * math.cos(th)))
+    pts += [(-2.0, 0.25), (2.0, 0.25)]
+    for i in range(0, 24):
+        th = PI / 2 * i / 24; pts.append((2 + 4.85 * math.sin(th), 5.05 - 4.85 * math.cos(th)))
+    pts += [(6.85, 5.1), (7.6, 5.1), (7.6, 0.0)]
+    finish(prism(pts, 14.0, 'xy'), 'HalfPipe_Body', PIPE_BLUE, smooth=20)
+    for x in (-6.85, 6.85):
+        finish(cyl(0.07, 0.07, 14.1, 16), f'HalfPipe_Coping{x}', CHROME, (x, 5.12, 0))
+    for z in (-7.01, 7.01):  # coloured side panels
+        finish(prism(pts, 0.02, 'xy'), f'HalfPipe_Side{z}', PIPE_SIDE, (0, 0, z), smooth=None)
+
+for f in (pistol, shotgun, smg, rocket_launcher, rocket, grenade, crossbow, sword, bat, sledgehammer, flamethrower, lightning_gun, freeze_ray, barrel, bomb, ragdoll,
+          crate, small_box, plank, block, brick, steel_block, domino, cart, wheel, melon, pin, bowling_ball, curling,
+          lambda: pine('M_Pine', False), lambda: pine('M_PineSnow', True), lambda: rock('M_Rock1', 0.3), lambda: rock('M_Rock2', 1.7), lambda: rock('M_Rock3', 3.1),
+          table, rack, lamp, dome, airlock, lambda: crater(6), lambda: crater(7), lambda: crater(10), half_pipe):
     f()
+
+# Join each new model's pieces by material, so a rack is a handful of meshes instead of hundreds.
+# A prop's '_Body' stays separate (the game swaps it in as the prop's own mesh).
+def merge_children(root):
+    groups = {}
+    for c in list(root.children):
+        if c.type != 'MESH' or c.name.endswith('_Body'): continue
+        for md in list(c.modifiers):
+            with bpy.context.temp_override(object=c, active_object=c, selected_objects=[c]):
+                bpy.ops.object.modifier_apply(modifier=md.name)
+        groups.setdefault(c.data.materials[0].name, []).append(c)
+    for mname, objs in groups.items():
+        if len(objs) > 1:
+            with bpy.context.temp_override(object=objs[0], active_object=objs[0], selected_objects=objs, selected_editable_objects=objs):
+                bpy.ops.object.join()
+        objs[0].name = f'{root.name}_{mname}'
+for r in [o for o in COLL.objects if o.parent is None and (o.name.startswith('M_') or (o.name.startswith('P_') and o.name not in ('P_Barrel', 'P_BarrelTrim', 'P_BombCap')))]:
+    merge_children(r)
 
 # ---------------------------------------------------------------- export
 roots = [o for o in COLL.objects if o.parent is None]
@@ -465,6 +857,11 @@ if PREVIEW:
         else:
             o.scale = (0.5, 0.5, 0.5); o.location = (x - 0.25 + (0.4 if o.name == 'P_BombCap' else 0), 0, z)
     t = bpy.data.objects['P_BarrelTrim']; t.scale = (0.5, 0.5, 0.5); t.location = bpy.data.objects['P_Barrel'].location
+    rag_objs = [bpy.data.objects['R_Ragdoll'], bpy.data.objects['R_BodyMesh']]
+    for o in COLL.objects:  # only the weapons sheet in this picture
+        top = o
+        while top.parent: top = top.parent
+        if top.name not in pos and top.name != 'P_BarrelTrim': o.hide_render = True
     cam = bpy.data.objects.new('Cam', bpy.data.cameras.new('Cam')); COLL.objects.link(cam)
     cam.data.type = 'ORTHO'; cam.data.ortho_scale = cols * cw + 0.2
     cam.location = ((cols - 1) * cw / 2, -5, -(len(order) // cols - 1) * ch / 2); cam.rotation_euler = (PI / 2, 0, 0)
@@ -479,3 +876,30 @@ if PREVIEW:
     scene.render.filepath = PREVIEW
     bpy.ops.render.render(write_still=True)
     print('PREVIEW', PREVIEW)
+    # second picture: the ragdoll, front three-quarter view, with one arm and leg posed to show the skinning
+    for o in COLL.objects: o.hide_render = True
+    for o in rag_objs: o.hide_render = False
+    pb = bpy.data.objects['R_Ragdoll'].pose.bones
+    pb['lArmR'].rotation_mode = 'XYZ'; pb['lArmR'].rotation_euler = (0, 0, 0)
+    bpy.context.view_layer.update()
+    cam.data.type = 'PERSP'; cam.data.lens = 50
+    cam.location = (2.2, -4.2, 1.25); cam.rotation_euler = (math.radians(88), 0, math.radians(28))
+    scene.render.resolution_x = 900; scene.render.resolution_y = 1100
+    scene.render.filepath = PREVIEW.replace('.png', '_ragdoll.png')
+    bpy.ops.render.render(write_still=True)
+    print('PREVIEW', scene.render.filepath)
+    # third picture: the props, three-quarter view
+    props_order = ['P_Crate', 'P_SmallBox', 'P_SteelBlock', 'P_Domino', 'P_Brick', 'P_Block', 'P_Melon', 'P_Pin', 'P_Curling', 'P_Wheel', 'P_CartBed', 'P_Plank', 'M_Rock1', 'M_Table']
+    for o in COLL.objects: o.hide_render = True
+    for i, name in enumerate(props_order):
+        r = bpy.data.objects[name]; c, row = i % 5, i // 5
+        r.location = (c * 1.3, row * 1.6, 0); r.rotation_euler = (0, 0, 0.5)
+        if name == 'M_Rock1': r.scale = (0.4, 0.4, 0.4)
+        if name == 'M_Table': r.scale = (0.4, 0.4, 0.4)
+        for o in [r] + list(r.children): o.hide_render = False
+    cam.data.type = 'ORTHO'; cam.data.ortho_scale = 7.5
+    cam.location = (2.6 + 6, 1.6 - 8, 6); cam.rotation_euler = (math.radians(55), 0, math.radians(37))
+    scene.render.resolution_x = 1400; scene.render.resolution_y = 1000
+    scene.render.filepath = PREVIEW.replace('.png', '_props.png')
+    bpy.ops.render.render(write_still=True)
+    print('PREVIEW', scene.render.filepath)
