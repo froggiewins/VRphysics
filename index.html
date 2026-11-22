@@ -129,8 +129,9 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
 renderer.xr.enabled = true;
 try { renderer.xr.setFoveation(1); } catch (e) {}
 
@@ -153,9 +154,10 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 2.4);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -28, right: 28, top: 28, bottom: -28, near: 1, far: 140 });
-sun.shadow.bias = -0.0004;
-sun.shadow.normalBias = 0.02;
+Object.assign(sun.shadow.camera, { left: -22, right: 22, top: 22, bottom: -22, near: 1, far: 120 }); // tighter: sharper shadows near you
+sun.shadow.bias = -0.0003;
+sun.shadow.normalBias = 0.025;
+sun.shadow.radius = 3;
 scene.add(sun, sun.target);
 
 addEventListener('resize', () => {
@@ -618,16 +620,34 @@ const goreUniforms = (nh, nb) => ({
   uBruiseK: { value: new Array(nb).fill(0) },
   uChar: { value: 0 },
 });
+// The wound shader works in the mesh's own space (vGoreP). It gives every hole a ragged edge, a raw,
+// swollen lip and a film of wet blood that runs downward; inside (back faces seen through a hole) it
+// draws a cut cross-section: a thin skin and fat layer at the edge, then fibrous, glistening muscle.
+// It also bumps the surface normal (lumpy meat, raised edges, swollen bruises) and makes wet areas glossy.
+const GORE_GLSL = `
+float gHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float gNoise(vec3 x) {
+  vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(gHash(i), gHash(i + vec3(1, 0, 0)), f.x), mix(gHash(i + vec3(0, 1, 0)), gHash(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(gHash(i + vec3(0, 0, 1)), gHash(i + vec3(1, 0, 1)), f.x), mix(gHash(i + vec3(0, 1, 1)), gHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+vec3 goreBump(vec3 surfPos, vec3 n, vec2 dH, float fd) { // bump mapping from a procedural height (as three.js does for bump maps)
+  vec3 sx = dFdx(surfPos), sy = dFdy(surfPos), r1 = cross(sy, n), r2 = cross(n, sx);
+  float det = dot(sx, r1) * fd;
+  return normalize(abs(det) * n - sign(det) * (dH.x * r1 + dH.y * r2));
+}`;
 function goreMaterial(color, o = {}) {
   const GORE_H = o.nh || GORE_HP, GORE_B = o.nb || GORE_BP; // per-part sizes, or larger for the whole skinned body
-  const mat = new THREE.MeshStandardMaterial({ color, roughness: o.rough ?? 0.75, side: THREE.DoubleSide });
+  const mat = o.physical
+    ? new THREE.MeshPhysicalMaterial({ color, roughness: o.rough ?? 0.75, side: THREE.DoubleSide, ...o.physical })
+    : new THREE.MeshStandardMaterial({ color, roughness: o.rough ?? 0.75, side: THREE.DoubleSide });
   const u = o.shared ? { ...o.shared } : goreUniforms(GORE_H, GORE_B);
   u.uCloth = { value: o.cloth ? 1 : 0 };
   u.uMeat = { value: new THREE.Color(o.meat ?? 0x7a1410) };
   u.uHoleScale = { value: o.holeScale ?? 1 };
   u.uBruiseOn = { value: o.noBruise ? 0 : 1 };
   mat.userData.gore = u;
-  mat.customProgramCacheKey = () => `gore${GORE_H}x${GORE_B}`;
+  mat.customProgramCacheKey = () => `gore2_${GORE_H}x${GORE_B}`;
   mat.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, u);
     sh.vertexShader = sh.vertexShader
@@ -638,39 +658,75 @@ function goreMaterial(color, o = {}) {
 varying vec3 vGoreP;
 uniform vec4 uHoles[${GORE_H}]; uniform vec4 uBruise[${GORE_B}]; uniform float uBruiseK[${GORE_B}];
 uniform float uCloth, uHoleScale, uBruiseOn, uChar; uniform vec3 uMeat;
-float goreN(vec3 p) { return fract(sin(dot(floor(p), vec3(12.9898, 78.233, 37.719))) * 43758.5453); }`)
+${GORE_GLSL}`)
       .replace('#include <map_fragment>', `#include <map_fragment>
+float goreWet = 0.0, goreH = 0.0;
 {
-  float rim = 0.0;
+  float n1 = gNoise(vGoreP * 55.0), n2 = gNoise(vGoreP * 170.0 + 7.0), n3 = gNoise(vGoreP * 420.0 + 3.0);
+  float rim = 0.0, blood = 0.0;
   for (int i = 0; i < ${GORE_H}; i++) {
     vec4 h = uHoles[i];
     if (h.w <= 0.0) continue;
-    float r = h.w * uHoleScale * (0.8 + 0.35 * goreN(vGoreP * 160.0 + float(i)));
-    float d = distance(vGoreP, h.xyz);
+    float r = h.w * uHoleScale * (0.7 + 0.45 * n1 + 0.15 * n2);   // ragged, torn edge
+    vec3 dv = vGoreP - h.xyz;
+    float d = length(dv);
     if (d < r) discard;
-    rim = max(rim, 1.0 - smoothstep(r, r * 1.7 + 0.006, d));
+    rim = max(rim, 1.0 - smoothstep(r, r * 1.45 + 0.004, d));
+    vec3 bd = dv; if (bd.y < 0.0) bd.y *= 0.3;                   // blood runs down (local -y is down when standing)
+    blood = max(blood, 1.0 - smoothstep(r * 1.05, r * 2.7 + 0.03, length(bd) + (n1 - 0.5) * r * 1.1 + (n3 - 0.5) * 0.006));
   }
-  float bz = 0.0;
-  if (uBruiseOn > 0.5) for (int i = 0; i < ${GORE_B}; i++) {
-    vec4 b = uBruise[i];
-    if (b.w <= 0.0) continue;
-    float d = distance(vGoreP, b.xyz);
-    float k = uBruiseK[i] * (1.0 - smoothstep(b.w * 0.25, b.w, d * (0.85 + 0.3 * goreN(vGoreP * 90.0))));
-    bz = max(bz, k);
+  if (gl_FrontFacing) {
+    float bz = 0.0;
+    if (uBruiseOn > 0.5) for (int i = 0; i < ${GORE_B}; i++) {
+      vec4 b = uBruise[i];
+      if (b.w <= 0.0) continue;
+      float d = distance(vGoreP, b.xyz) * (0.8 + 0.4 * n1);
+      bz = max(bz, uBruiseK[i] * (1.0 - smoothstep(b.w * 0.2, b.w, d)));
+    }
+    bz *= 0.8 + 0.4 * n2;                                           // mottled
+    // bruise: yellow-green fringe, red-purple, deep purple-black core
+    vec3 bc = uCloth > 0.5 ? mix(diffuseColor.rgb * 0.8, mix(diffuseColor.rgb * 0.4, vec3(0.2, 0.02, 0.02), 0.6), bz)
+      : mix(mix(vec3(0.6, 0.55, 0.25), vec3(0.5, 0.14, 0.26), smoothstep(0.1, 0.45, bz)), vec3(0.16, 0.04, 0.14), smoothstep(0.45, 0.95, bz));
+    diffuseColor.rgb = mix(diffuseColor.rgb, bc, clamp(bz * 1.2, 0.0, 0.9));
+    goreH += bz * 0.35;                                             // swelling
+    // blood film: fresh red to dark clotted; soaked cloth just goes dark and damp
+    float bm = clamp(blood * (0.7 + 0.6 * n2), 0.0, 1.0);
+    vec3 bloodCol = mix(vec3(0.32, 0.012, 0.01), vec3(0.12, 0.004, 0.004), smoothstep(0.35, 0.85, n2 * 0.6 + n3 * 0.4));
+    diffuseColor.rgb = mix(diffuseColor.rgb, uCloth > 0.5 ? mix(diffuseColor.rgb * 0.3, vec3(0.16, 0.012, 0.01), 0.7) : bloodCol, bm); // soaked cloth goes maroon-black
+    goreWet = max(goreWet, bm * (uCloth > 0.5 ? 0.35 : 0.9));
+    goreH += bm * n3 * 0.25;                                        // little clots
+    // torn edge: raw and swollen
+    vec3 rimCol = mix(vec3(0.38, 0.03, 0.025), vec3(0.66, 0.16, 0.12), n2);
+    diffuseColor.rgb = mix(diffuseColor.rgb, rimCol, rim * 0.95);
+    goreWet = max(goreWet, rim);
+    goreH += rim * (0.5 + 0.5 * n3);
+    // patchy burns
+    float ch = uChar * smoothstep(0.25, 0.75, n1 * 0.7 + n2 * 0.3 + uChar * 0.5);
+    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.05, 0.035, 0.028) * (0.6 + 0.9 * n3), ch);
+    goreH += ch * n2 * 0.4;
+  } else {
+    // cut cross-section, seen through a hole: fibrous muscle, with skin and yellow fat at the cut edge
+    float fib = 0.5 + 0.5 * sin(vGoreP.y * 900.0 + n1 * 10.0 + n2 * 3.0);
+    vec3 muscle = mix(uMeat * 0.55, uMeat * 1.3 + vec3(0.07, 0.0, 0.0), fib * 0.65 + n2 * 0.35);
+    vec3 fat = mix(vec3(0.85, 0.72, 0.46), vec3(0.95, 0.85, 0.62), n3);
+    float edge = smoothstep(0.5, 0.92, rim);
+    diffuseColor.rgb = mix(muscle, uCloth > 0.5 ? diffuseColor.rgb * 0.6 : fat, edge * 0.85);
+    goreWet = 0.85 - edge * 0.3;
+    goreH = fib * 0.45 + n1 * 0.9 + n3 * 0.2;
   }
-  vec3 bc = uCloth > 0.5 ? mix(vec3(0.42, 0.06, 0.04), vec3(0.22, 0.02, 0.02), bz)
-                         : mix(vec3(0.62, 0.55, 0.28), mix(vec3(0.42, 0.12, 0.32), vec3(0.2, 0.08, 0.24), bz), smoothstep(0.15, 0.55, bz));
-  diffuseColor.rgb = mix(diffuseColor.rgb, bc, clamp(bz * 1.15, 0.0, 0.9));
-  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.38, 0.02, 0.02), rim * 0.92);
-  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.07, 0.04, 0.03), uChar);
-  if (!gl_FrontFacing) diffuseColor.rgb = uMeat;
-}`);
+}`)
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.13, goreWet);')
+      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\nnormal = goreBump(-vViewPosition, normal, vec2(dFdx(goreH), dFdy(goreH)) * 0.0035, faceDirection);');
   };
   return mat;
 }
 const GORE_COL = { bone: 0xe9e0c8, lung: 0xe07a8a, heart: 0x8f0f18, liver: 0x6a1d14, stomach: 0xd98a7a, gut: 0xd47a80, brain: 0xe8a2a8, kidney: 0x7a2418, muscle: 0x9a2a22 };
 const goreMats = {};
-function goreMat(k) { return goreMats[k] || (goreMats[k] = new THREE.MeshStandardMaterial({ color: GORE_COL[k], roughness: k === 'bone' ? 0.6 : 0.35, metalness: 0 })); }
+function goreMat(k) { // organs are wet and glossy; bone is dry
+  return goreMats[k] || (goreMats[k] = k === 'bone'
+    ? new THREE.MeshStandardMaterial({ color: GORE_COL[k], roughness: 0.55, metalness: 0 })
+    : new THREE.MeshPhysicalMaterial({ color: GORE_COL[k], roughness: 0.45, metalness: 0, clearcoat: 0.8, clearcoatRoughness: 0.15, sheen: 0.3, sheenColor: new THREE.Color(0xff9a9a) }));
+}
 // Builds bones and organs inside a body part. Hidden until the part is opened up.
 function buildInnards(key, mesh, s, P) {
   const g = new THREE.Group(); g.visible = false;
@@ -764,7 +820,7 @@ function woundNPC(npc, key, worldPt, kind, size, o = {}) {
     else g.holes.push({ x: p.x, y: p.y, z: p.z, r });
     npc.bleed = Math.min(25, (npc.bleed || 0) + 3 + r * 60);
     const wp = V3(worldPt.x, worldPt.y, worldPt.z);
-    burst(wp, 0x9a1010, Math.round(4 + r * 120));
+    bloodSpray(wp, o.dir ? V3(o.dir.x, o.dir.y, o.dir.z) : null, Math.round(6 + r * 160), 2.2);
     if (o.gibs !== false) { const n = Math.min(4, Math.round(r * 50)); for (let i = 0; i < n; i++) spawnGib(wp, o.dir, rand(0.012, 0.02) + r * 0.15, key === 'head' && Math.random() < 0.4 ? GORE_COL.brain : null); }
     bloodSplat(wp, 0.08 + r * 2.5);
     kind = 'bruise'; size = r * 2.2;                     // ring of bruising round every wound
@@ -788,11 +844,26 @@ function woundFacing(npc, key, srcPos, kind, size, o) {
   const w = b.pointToWorldFrame(CV(sp));
   woundNPC(npc, key, w, kind, size, o);
 }
-// Little physical bits of meat
-const gibs = [], splats = [];
+// ---- Blood and gibs -----------------------------------------------------------------
+// Gibs are lumpy, wet chunks that leave a smear where they land. Blood is real droplets that
+// fly, stretch with speed and splash into splatter decals; decals dry darker and duller over
+// time, pools spread under bleeding bodies, and cut-off stumps spurt in time with a heartbeat.
+const gibs = [], splats = [], drops = [];
 const G_GIB = 16;
-const gibGeo = new THREE.IcosahedronGeometry(1, 0);
+const gibGeos = [0, 1, 2].map(seed => {
+  const g = new THREE.IcosahedronGeometry(1, 1), p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const k = 0.72 + 0.28 * Math.sin(x * 4.1 + seed * 2.3) * Math.cos(y * 3.7 - seed) + 0.12 * Math.sin(z * 9.3 + seed * 5);
+    p.setXYZ(i, x * k, y * k * 0.8, z * k);
+  }
+  g.computeVertexNormals(); return g;
+});
+const wetMat = (color, rough = 0.4) => new THREE.MeshPhysicalMaterial({ color, roughness: rough, clearcoat: 0.9, clearcoatRoughness: 0.12 });
+const gibMats = [wetMat(0x7a1410), wetMat(0x4a0808, 0.35), wetMat(0xd9b48a, 0.5)]; // muscle, clot, fat
+const gibColMats = new Map();
 function spawnGib(pos, dir, size, color) {
+  if (state.gore !== 2) return;
   if (gibs.length >= 50) removeGib(gibs[0]);
   const body = new CANNON.Body({ mass: 0.15, material: MAT.def, collisionFilterGroup: G_GIB, collisionFilterMask: G_WORLD, linearDamping: 0.15, angularDamping: 0.5 });
   body.addShape(new CANNON.Sphere(size * 0.8));
@@ -801,13 +872,16 @@ function spawnGib(pos, dir, size, color) {
   body.velocity.set(d.x, d.y, d.z);
   body.angularVelocity.set(rand(-15, 15), rand(-15, 15), rand(-15, 15));
   world.addBody(body);
-  const mesh = new THREE.Mesh(gibGeo, new THREE.MeshStandardMaterial({ color: color ?? (Math.random() < 0.25 ? 0xd88a86 : 0x8a1812), roughness: 0.35 }));
+  let mat = gibMats[Math.random() < 0.55 ? 0 : Math.random() < 0.6 ? 1 : 2];
+  if (color != null) { if (!gibColMats.has(color)) gibColMats.set(color, wetMat(color)); mat = gibColMats.get(color); }
+  const mesh = new THREE.Mesh(gibGeos[Math.floor(Math.random() * 3)], mat);
   mesh.scale.set(size * rand(0.8, 1.3), size * rand(0.6, 1), size * rand(0.8, 1.3));
   mesh.castShadow = true; fxGroup.add(mesh);
-  const gib = { body, mesh, t: 0, life: rand(14, 20), sc: mesh.scale.clone() };
-  gibs.push(gib);
+  let smeared = false; // leaves a smear where it first lands
+  body.addEventListener('collide', () => { if (smeared) return; smeared = true; queue.push(() => bloodSplat(V3(body.position.x, body.position.y, body.position.z), size * 2.2 + 0.03)); });
+  gibs.push({ body, mesh, t: 0, life: rand(14, 20), sc: mesh.scale.clone() });
 }
-function removeGib(g) { gibs.splice(gibs.indexOf(g), 1); world.removeBody(g.body); fxGroup.remove(g.mesh); g.mesh.material.dispose(); }
+function removeGib(g) { gibs.splice(gibs.indexOf(g), 1); world.removeBody(g.body); fxGroup.remove(g.mesh); }
 function updateGibs(dt) {
   for (let i = gibs.length - 1; i >= 0; i--) {
     const g = gibs[i]; g.t += dt;
@@ -816,34 +890,132 @@ function updateGibs(dt) {
     if (g.t > g.life - 1) g.mesh.scale.copy(g.sc).multiplyScalar(Math.max(0.01, g.life - g.t));
     if (g.t > g.life || p.y < -60) removeGib(g);
   }
+  updateDrops(dt); updateSplats(dt);
 }
-const splatGeo = new THREE.CircleGeometry(1, 14);
+// splatter shapes, drawn once: a main blob, flung droplets and streaks; pools are soft and round
+function makeSplatTex(kind, seed) {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d'), R = seeded(seed * 97 + 13);
+  g.fillStyle = g.strokeStyle = '#fff'; g.lineCap = 'round';
+  const blob = (x, y, r) => { g.beginPath(); g.arc(x, y, Math.max(0.5, r), 0, 7); g.fill(); };
+  if (kind === 'pool') {
+    g.filter = 'blur(3px)';
+    for (let i = 0; i < 16; i++) { const a = R() * 6.28, d = R() * 20; blob(64 + Math.cos(a) * d, 64 + Math.sin(a) * d, 24 + R() * 16); }
+  } else {
+    for (let i = 0; i < 9; i++) { const a = R() * 6.28, d = R() * 16; blob(64 + Math.cos(a) * d, 64 + Math.sin(a) * d, 9 + R() * 14); }
+    for (let i = 0; i < 6; i++) {
+      const a = R() * 6.28, l = 22 + R() * 36; g.lineWidth = 2 + R() * 4;
+      g.beginPath(); g.moveTo(64 + Math.cos(a) * 12, 64 + Math.sin(a) * 12); g.lineTo(64 + Math.cos(a) * l, 64 + Math.sin(a) * l); g.stroke();
+      blob(64 + Math.cos(a) * l, 64 + Math.sin(a) * l, g.lineWidth * 0.9);
+    }
+    for (let i = 0; i < 30; i++) { const a = R() * 6.28, d = 26 + R() * 34; blob(64 + Math.cos(a) * d, 64 + Math.sin(a) * d, 0.8 + R() * 3.5 * (1 - d / 70)); }
+  }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4;
+  return t;
+}
+const SPLAT_TEX = [1, 2, 3, 4, 5].map(s => makeSplatTex('splat', s)), POOL_TEX = [makeSplatTex('pool', 9), makeSplatTex('pool', 11)];
+const splatGeo = new THREE.PlaneGeometry(2, 2);
+const C_FRESH = new THREE.Color(0x6e0707), C_DRY = new THREE.Color(0x2a0405);
 const _gr = new CANNON.RaycastResult();
-function bloodSplat(pos, r, dir) {
-  if (state.gore !== 2) return;
+function bloodSplat(pos, r, dir, kind = 'splat') {
+  if (state.gore !== 2) return null;
   const from = new CANNON.Vec3(pos.x, pos.y + 0.05, pos.z), to = new CANNON.Vec3(pos.x + (dir?.x || 0), pos.y - 4, pos.z + (dir?.z || 0));
-  if (!world.raycastClosest(from, to, { collisionFilterMask: G_WORLD, skipBackfaces: true }, _gr)) return;
+  if (!world.raycastClosest(from, to, { collisionFilterMask: G_WORLD, skipBackfaces: true }, _gr)) return null;
   const n = _gr.hitNormalWorld, hp = _gr.hitPointWorld;
-  if (splats.length >= 90) { const s = splats.shift(); fxGroup.remove(s); s.material.dispose(); }
-  const m = new THREE.Mesh(splatGeo, new THREE.MeshStandardMaterial({ color: Math.random() < 0.5 ? 0x5e0808 : 0x730b0b, roughness: 0.25, transparent: true, opacity: 0.92, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 - splats.length * 0.01 }));
-  m.position.set(hp.x + n.x * 0.004, hp.y + n.y * 0.004, hp.z + n.z * 0.004);
+  if (splats.length >= 120) { const s = splats.shift(); s.userData.dead = true; fxGroup.remove(s); s.material.dispose(); }
+  const pool = kind === 'pool';
+  const m = new THREE.Mesh(splatGeo, new THREE.MeshStandardMaterial({
+    map: pool ? POOL_TEX[Math.floor(Math.random() * 2)] : SPLAT_TEX[Math.floor(Math.random() * 5)], color: C_FRESH.clone().multiplyScalar(rand(0.85, 1.1)),
+    roughness: 0.06, metalness: 0, transparent: true, alphaTest: 0.04, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 - splats.length * 0.01,
+  }));
+  m.position.set(hp.x + n.x * 0.003, hp.y + n.y * 0.003, hp.z + n.z * 0.003);
   m.lookAt(m.position.clone().add(V3(n.x, n.y, n.z)));
   m.rotateZ(Math.random() * 6.3);
-  m.scale.set(r * rand(0.8, 1.3), r * rand(0.6, 1), 1);
-  m.renderOrder = 1; fxGroup.add(m); splats.push(m);
+  const sr = r * (pool ? 1 : rand(0.85, 1.25)) * 0.62; // the texture leaves a margin round the shape
+  m.scale.set(sr * rand(0.85, 1.15), sr * rand(0.85, 1.15), 1);
+  m.userData = { t: 0, grow: 0, target: 0, dry: rand(60, 120) };
+  m.renderOrder = 1; m.receiveShadow = true; fxGroup.add(m); splats.push(m);
+  return m;
+}
+function updateSplats(dt) {
+  for (const s of splats) {
+    const u = s.userData; u.t += dt;
+    const k = Math.min(1, u.t / u.dry);   // drying: darker and duller
+    s.material.color.copy(C_FRESH).lerp(C_DRY, k); s.material.roughness = 0.06 + 0.5 * k;
+    if (u.grow > 0 && s.scale.x < u.target) s.scale.multiplyScalar(1 + u.grow * dt / Math.max(0.05, s.scale.x)); // pools spread
+  }
+}
+const dropGeo = new THREE.SphereGeometry(1, 6, 4), dropMat = new THREE.MeshPhysicalMaterial({ color: 0x5c0303, roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.05 });
+const _dq = V3(), UPY = V3(0, 1, 0);
+// a spray of droplets; dir (optional) is the main direction, speed in m/s
+function bloodSpray(pos, dir, n, speed = 2.5, size = 1) {
+  if (state.gore !== 2 || n <= 0) return;
+  let fy = -100;
+  if (world.raycastClosest(new CANNON.Vec3(pos.x, pos.y + 0.02, pos.z), new CANNON.Vec3(pos.x, pos.y - 6, pos.z), { collisionFilterMask: G_WORLD, skipBackfaces: true }, _gr)) fy = _gr.hitPointWorld.y;
+  const d0 = dir && (dir.x || dir.y || dir.z) ? V3(dir.x, dir.y, dir.z).normalize() : null;
+  for (let i = 0; i < n; i++) {
+    if (drops.length >= 260) { const o = drops.shift(); fxGroup.remove(o.m); }
+    const m = new THREE.Mesh(dropGeo, dropMat);
+    m.position.set(pos.x, pos.y, pos.z);
+    const rnd = V3(rand(-1, 1), rand(-0.6, 1.2), rand(-1, 1)).multiplyScalar(speed * 0.55);
+    const v = d0 ? d0.clone().multiplyScalar(speed * rand(0.6, 1.2)).add(rnd) : rnd.add(V3(0, speed * 0.3, 0));
+    drops.push({ m, v, r: rand(0.004, 0.011) * size, fy, t: 0 });
+    fxGroup.add(m);
+  }
+}
+function updateDrops(dt) {
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i]; d.t += dt;
+    d.v.y -= 9.8 * dt; d.m.position.addScaledVector(d.v, dt);
+    const sp = d.v.length();
+    d.m.scale.set(d.r, d.r * (1 + Math.min(3, sp * 0.4)), d.r);      // stretched along its path
+    if (sp > 1e-3) d.m.quaternion.setFromUnitVectors(UPY, _dq.copy(d.v).divideScalar(sp));
+    const landed = d.m.position.y <= d.fy + 0.004;
+    if (landed || d.t > 2.5) {
+      if (landed && Math.random() < (splats.length < 90 ? 0.3 : 0.08)) bloodSplat(d.m.position, d.r * rand(4, 8));
+      fxGroup.remove(d.m); drops.splice(i, 1);
+    }
+  }
 }
 function clearGore() {
   while (gibs.length) removeGib(gibs[0]);
-  while (splats.length) { const s = splats.pop(); fxGroup.remove(s); s.material.dispose(); }
+  while (splats.length) { const s = splats.pop(); s.userData.dead = true; fxGroup.remove(s); s.material.dispose(); }
+  while (drops.length) fxGroup.remove(drops.pop().m);
 }
-// Per-frame bleeding and charring
+// Per-frame bleeding, pools, stump spurts and charring
 function goreThink(n, dt) {
   if (!state.gore || !n.gore) return;
   if (n.burn > 0) {
     n.charred = Math.min(0.85, (n.charred || 0) + dt * 0.06);
     for (const g of Object.values(n.gore)) g.u.uChar.value = n.charred;
   }
-  if (!(n.bleed > 0) || state.gore !== 2) return;
+  if (state.gore !== 2) return;
+  if (n.spurts?.length) { // cut-off stumps pump blood in time with the heart, weaker as it runs out
+    for (const sp of n.spurts) sp.t -= dt * (n.state === 'dead' ? 2 : 1);
+    n.spurts = n.spurts.filter(sp => sp.t > 0);
+    n.spurtT = (n.spurtT || 0) - dt;
+    if (n.spurtT <= 0 && n.spurts.length) {
+      n.spurtT = 0.035;
+      const beat = Math.pow(Math.max(0, Math.sin(performance.now() * 0.0075)), 3);
+      for (const sp of n.spurts) {
+        const b = n.parts[sp.key], w = b.pointToWorldFrame(new CANNON.Vec3(...sp.p)), out = w.vsub(b.position); out.normalize();
+        const f = Math.min(1, sp.t / 2) * sp.k;
+        bloodSpray(V3(w.x, w.y, w.z), V3(out.x, out.y, out.z), Math.round(1 + 2 * beat * f), (0.6 + 3.4 * beat) * f + 0.3, 1.2);
+      }
+    }
+  }
+  const T = n.parts.torso;
+  if (n.pool && !n.pool.userData.dead) n.pool.userData.grow = 0;
+  if (!(n.bleed > 0)) return;
+  // lying still and bleeding: a pool spreads underneath
+  if (n.bleed > 3 && n.state !== 'active' && T.velocity.length() < 0.4) {
+    const p = n.pool;
+    if (!p || p.userData.dead || Math.hypot(p.position.x - T.position.x, p.position.z - T.position.z) > 0.5) {
+      n.pool = bloodSplat(V3(T.position.x, T.position.y, T.position.z), 0.1, null, 'pool');
+      if (n.pool) n.pool.userData.target = (0.45 + 0.3 * n.s) * 0.62;
+    }
+    if (n.pool) n.pool.userData.grow = 0.025 * Math.min(1, n.bleed / 10);
+  }
   n.bleed -= dt * (n.state === 'dead' ? 0.5 : 1);
   n.dripT = (n.dripT || 0) - dt;
   if (n.dripT > 0) return;
@@ -851,17 +1023,8 @@ function goreThink(n, dt) {
   const keys = Object.keys(n.gore).filter(k => n.gore[k].holes.length);
   if (!keys.length) return;
   const k = keys[Math.floor(Math.random() * keys.length)], g = n.gore[k], h = g.holes[Math.floor(Math.random() * g.holes.length)];
-  const w = n.parts[k].pointToWorldFrame(new CANNON.Vec3(h.x, h.y, h.z));
-  const wp = V3(w.x, w.y, w.z);
-  bloodDrop(wp, n.parts[k].velocity);
-  if (Math.random() < 0.35) bloodSplat(wp, rand(0.03, 0.08));
-}
-function bloodDrop(pos, bv) {
-  const m = new THREE.Mesh(gibGeo, goreMat('heart'));
-  m.scale.setScalar(rand(0.006, 0.011)); m.position.copy(pos); fxGroup.add(m);
-  const v = V3(bv.x * 0.5 + rand(-0.3, 0.3), bv.y * 0.5 + rand(-0.2, 0.4), bv.z * 0.5 + rand(-0.3, 0.3));
-  let t = 0;
-  fx.push({ update(dt) { t += dt; v.y -= 9.8 * dt; m.position.addScaledVector(v, dt); if (t > 0.7) { fxGroup.remove(m); return false; } return true; } });
+  const w = n.parts[k].pointToWorldFrame(new CANNON.Vec3(h.x, h.y, h.z)), bv = n.parts[k].velocity;
+  bloodSpray(V3(w.x, w.y, w.z), V3(bv.x, bv.y, bv.z), Math.random() < 0.3 ? 2 : 1, 0.4);
 }
 
 // ====================================================================
@@ -1695,6 +1858,29 @@ const MAPS = [
   },
 ];
 
+// ---- Image-based lighting: each map gets an environment (its sky, a horizon glow, the ground and a
+// ground) so every material picks up soft, coloured fill light and real reflections.
+const pmrem = new THREE.PMREMGenerator(renderer);
+const ENV_GROUND = [0x4f7a3c, 0x666a70, 0x7a7a7a, 0x3e434b, 0xd4e2f0];
+let envRT = null;
+function buildEnvironment(i) {
+  const M = MAPS[i], es = new THREE.Scene();
+  const sky = new THREE.Color(M.sky), k = M.hemi;
+  const top = sky.clone().multiplyScalar(0.5 * k), hor = sky.clone().lerp(new THREE.Color(1, 1, 1), 0.3).multiplyScalar(0.6 * k);
+  const bot = new THREE.Color(ENV_GROUND[i] ?? 0x444444).multiplyScalar(0.35 * k + 0.03);
+  const geo = new THREE.SphereGeometry(10, 32, 16);
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, uniforms: { top: { value: top }, hor: { value: hor }, bot: { value: bot } },
+    vertexShader: 'varying vec3 vP; void main() { vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform vec3 top, hor, bot; varying vec3 vP; void main() { float h = normalize(vP).y; gl_FragColor = vec4(h > 0.0 ? mix(hor, top, pow(h, 0.6)) : mix(hor, bot, pow(-h, 0.3)), 1.0); }',
+  });
+  es.add(new THREE.Mesh(geo, mat));
+  // (the sun itself is the directional light; putting it in here as well would light everything twice)
+  if (envRT) envRT.dispose();
+  envRT = pmrem.fromScene(es, 0.02);
+  scene.environment = envRT.texture;
+  geo.dispose(); mat.dispose();
+}
 function loadMap(i) {
   if (net.on && net.decided && !net.applying) {
     if (!net.host) { netSend({ t: 'mapreq', i }); toast(`Asking the host to load ${MAPS[i].name}`); return; }
@@ -1714,7 +1900,8 @@ function loadMapLocal(i, gen, owner) {
   const M = MAPS[i];
   scene.background = new THREE.Color(M.sky);
   scene.fog = M.fog ? new THREE.Fog(M.fog[0], M.fog[1], M.fog[2]) : null;
-  sun.intensity = M.sun; hemi.intensity = M.hemi;
+  sun.intensity = M.sun; hemi.intensity = M.hemi * 0.3; // most of the fill light now comes from the environment
+  buildEnvironment(i);
   state.gravity = M.g; applyGravity();
   M.build();
   undoStack.length = 0;
@@ -2046,7 +2233,8 @@ function castRay(origin, dir, range, excludeEnt) {
 }
 function hitEnt(hit, dir, o) {
   if (hit.balloon) { popBalloon(hit.balloon); return; }
-  burst(hit.point, hit.ent?.type === 'npc' ? 0xb02020 : (o.sparks || 0xffd27a), o.bits ?? 4);
+  if (hit.ent?.type === 'npc') bloodSpray(hit.point, dir.clone().negate().add(hit.normal), 10 + (o.bits ?? 4) * 2, 2.4); // spray back out of the wound
+  else burst(hit.point, o.sparks || 0xffd27a, o.bits ?? 4);
   if (hit.ent?.type === 'avatar') { netPvpHit(hit.ent, o.dmg, dir); return; }
   const b = hit.body;
   if (!b || hit.isStatic) return;
@@ -2135,13 +2323,14 @@ function severNPC(n, key, remote = false) {
   const sub = [key, ...(SEVER_KIDS[key] || [])]; sub.forEach(k => n.off.add(k));
   if (n.skin) skinSplit(n, sub);
   if (key.includes('Leg')) n.legless = true;
+  (n.spurts ||= []).push({ key: j.a, p: j.pa, t: 6, k: 1 }, { key, p: j.pb, t: 2.5, k: 0.5 }); // both ends pump blood
   if (remote) return; // the owner sends the wounds and damage
   if (net.on && n.nid) netSend({ t: 'sev', id: n.nid, k: key });
   const pa = n.parts[j.a].pointToWorldFrame(new CANNON.Vec3(...j.pa)), pb = n.parts[key].pointToWorldFrame(new CANNON.Vec3(...j.pb));
   const r = n.gore[key]?.maxR || 0.05;
   woundNPC(n, j.a, V3(pa.x, pa.y, pa.z), 'hole', r * 1.2, { gibs: true });
   woundNPC(n, key, V3(pb.x, pb.y, pb.z), 'hole', r * 1.2, { gibs: false });
-  n.bleed = 25; burst(V3(pa.x, pa.y, pa.z), 0xb01010, 30); bloodSplat(V3(pa.x, 0, pa.z), 0.6);
+  n.bleed = 25; bloodSpray(V3(pa.x, pa.y, pa.z), null, 50, 3); bloodSplat(V3(pa.x, pa.y, pa.z), 0.5);
   const lim = n.parts[key], away = lim.position.vsub(n.parts[j.a].position); away.normalize();
   lim.velocity.vadd(away.scale(2.5), lim.velocity);
   SFX.impact(12, lim.position, 'flesh');
@@ -2251,7 +2440,7 @@ function meleeHit(ent, e) {
       if (M.sharp && trySkewer(ent, n, other, point, vel)) { SFX.impact(v * 1.5, other.position, 'flesh'); hand?.pulse(1, 90); return; }
       if (M.sharp) cutNPC(n, other.npcPart, v);
       other.applyImpulse(vel.scale(M.knock * other.mass * 0.35));
-      SFX.impact(v * 1.5, other.position, 'flesh'); burst(point, 0xb02020, 6); hand?.pulse(0.9, 60);
+      SFX.impact(v * 1.5, other.position, 'flesh'); bloodSpray(point, V3(vel.x, vel.y, vel.z), 14, 1.8); hand?.pulse(0.9, 60);
     });
   } else if (other.ent?.type === 'avatar' && v > 2.5) {
     w.lastHit = now; netPvpHit(other.ent, v * M.dmg * 0.6, ent.body.velocity); hand?.pulse(0.9, 60);
@@ -2539,7 +2728,9 @@ function ragSkinAttach(npc, lay) {
   const skel = new THREE.Skeleton(bones, inv), u = goreUniforms(GORE_SKIN, GORE_SKIN), group = new THREE.Group(), mats = {};
   for (const { geo, role } of RAG_SKIN) {
     const mat = role === 'shoes' ? new THREE.MeshStandardMaterial({ color: ACC_COLS[lay.b.shoes] || 0x1b1b1b, roughness: 0.6 })
-      : goreMaterial(npc.colors[role], { cloth: role !== 'skin', shared: u, nh: GORE_SKIN, nb: GORE_SKIN });
+      : goreMaterial(npc.colors[role], { cloth: role !== 'skin', shared: u, nh: GORE_SKIN, nb: GORE_SKIN, rough: role === 'skin' ? 0.52 : 0.88,
+          physical: role === 'skin' ? { sheen: 0.25, sheenRoughness: 0.5, sheenColor: new THREE.Color(0xffd2c0), specularIntensity: 0.55 }
+                                    : { sheen: 0.9, sheenRoughness: 0.75, sheenColor: new THREE.Color(0xffffff).lerp(new THREE.Color(npc.colors[role]), 0.6) } });
     const m = new THREE.SkinnedMesh(geo, mat);
     m.bind(skel, new THREE.Matrix4()); m.frustumCulled = false; m.castShadow = m.receiveShadow = true;
     m.raycast = () => {}; // hits go to the part stand-ins
