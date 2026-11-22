@@ -26,6 +26,8 @@ The Duel tab sets up a one-on-one fight against a ragdoll that fights back. Pick
 
 ## Gore
 
+**Chopping and skewering:** sharp melee weapons (the Sword and any drawn weapon with a sharp edge) cut limbs off. Hits add up on a part, and once a forearm, upper arm, shin, thigh or the neck has taken enough, it comes off at the joint, leaving a bloody stump with the bone showing. Hard, clean hits can do it in one. A ragdoll missing an arm keeps walking. One missing a leg can't stand up, and one missing its head is dead for good. A thrust along the blade skewers the part it hits onto the blade (up to three ragdolls per weapon), so you can lift and carry ragdolls on your sword. Flick or slash hard to fling them off. On desktop, the Sword's trigger cycles slash, backhand and stab, and the stab is what skewers. Chopping needs **World → Gore** set to Full.
+
 NPCs have a skeleton (skull, spine, ribs, pelvis and limb bones) and organs (brain, lungs, heart, liver, stomach, kidneys and intestines) inside them. Bullets, blades, explosions and very hard impacts take chunks out of the body so you can see inside, throw out bits of meat and leave blood on the ground. Wounded NPCs keep bleeding for a while. Blunt hits, falls and being thrown into things leave bruises that darken with repeated hits, and fire chars the skin. Reviving an NPC heals it. Set **World → Gore** to Full, Bruises only or Off. **Clean up blood** removes the mess.
 
 ## Weapon Workshop

@@ -1070,6 +1070,7 @@ function createNPC(pos, yaw, o) {
     const axis = ax > 0 ? UP : DOWN;
     const c = new CANNON.ConeTwistConstraint(P[a], P[b], { pivotA: S(...pa), pivotB: S(...pb), axisA: axis, axisB: axis, angle, twistAngle: twist, collideConnected: false });
     world.addConstraint(c); npc.constraints.push(c);
+    (npc.joints ||= []).push({ a, b, c, pa: pa.map(v => v * s), pb: pb.map(v => v * s) }); // for cutting limbs off
   }
 
   const T = P.torso;
@@ -1156,6 +1157,8 @@ function npcBubbles() {
     if (now > b.until) { b.sp.visible = false; continue; }
     const h = n.meshes.head.position;
     b.sp.position.set(h.x, h.y + 0.38 * n.s, h.z);
+    const k = 0.55 * Math.max(0.7, Math.min(1.6, n.s)) * clamp(b.sp.position.distanceTo(headPos) / 2.2, 0.25, 1); // smaller up close
+    b.sp.scale.set(k * 512 / 96 * 0.5, k * 0.5, 1);
     b.sp.material.opacity = Math.min(1, (b.until - now) / 350);
   }
 }
@@ -1182,7 +1185,7 @@ function hurtNPC(npc, dmg) {
   }
 }
 function reviveNPC(npc) {
-  if (netFwd(npc, 'revive') || !netMine(npc)) return;
+  if (netFwd(npc, 'revive') || !netMine(npc) || npc.off?.has('head')) return; // no coming back without a head
   npc.health = npc.maxHealth; npc.state = 'ragdoll'; npc.ragTimer = 0.3; goreHeal(npc);
   for (const m of Object.values(npc.meshes)) m.material.color.set(npc.colors[m.userData.role]);
   npc.eyes?.forEach(e => e.scale.set(1, 1, 1));
@@ -1212,7 +1215,8 @@ function npcThink(n, dt) {
   if (n.state === 'dead') return;
   if (n.state === 'ragdoll') {
     n.ragTimer -= dt;
-    if (n.ragTimer <= 0 && T.velocity.length() < 2.5) {
+    if (n.pins) n.pins = n.pins.filter(c => joints.some(j => j.c === c)); // still stuck on a blade?
+    if (n.ragTimer <= 0 && T.velocity.length() < 2.5 && !n.legless && !n.pins?.length) {
       n.state = 'active'; n.strength = 0;
       // back on their feet near you: rub it in
       if (state.ai && n.behavior !== 3 && Math.random() < 0.6 && T.position.distanceTo(headPos) < 10) later(1.2, () => { if (n.state === 'active') { npcSay(n, sayPick('up')); n.teaseT = 1.4; } });
@@ -1291,9 +1295,11 @@ function springTo(b, tx, ty, tz, kp, kd, ref, k) {
   b.force.y += m * (kp * (ty - b.position.y) - kd * (b.velocity.y - ref.y));
   b.force.z += m * (kp * (tz - b.position.z) - kd * (b.velocity.z - ref.z));
 }
+const NOBODY = { type: 'none' }; // springTo ignores it: used for parts that have been cut off
 function npcControl(n) {
-  if (n.state !== 'active' || n.removed) return;
+  if (n.state !== 'active' || n.removed || n.legless) return;
   const T = n.parts.torso, s = n.s, L = n.L || NPC_L0, k = n.strength * L.musc, ks = n.strength * Math.min(1, 0.55 + 0.45 * L.musc);
+  const P = n.liveParts || n.parts;
   if (T.type !== DYN) return;
   const g = -world.gravity.y;
   _from.copy(T.position); _to.set(T.position.x, T.position.y - 2 * L.hipH * s, T.position.z);
@@ -1325,7 +1331,7 @@ function npcControl(n) {
   T.torque.y += n.Iy * (22 * e - 7 * w.y) * k * (_up.y > 0.5 ? 1 : 0.2);
   // head
   _l.set(0, L.headD * s, 0); T.pointToWorldFrame(_l, _hd);
-  springTo(n.parts.head, _hd.x, _hd.y + (n.dance ? Math.sin(n.danceT * 9) * 0.03 * s : 0), _hd.z, 50, 7, T.velocity, k);
+  springTo(P.head, _hd.x, _hd.y + (n.dance ? Math.sin(n.danceT * 9) * 0.03 * s : 0), _hd.z, 50, 7, T.velocity, k);
   if (!grounded) return;
   const fx = Math.sin(n.yaw), fz = Math.cos(n.yaw);
   const spd = Math.hypot(T.velocity.x, T.velocity.z);
@@ -1338,18 +1344,18 @@ function npcControl(n) {
     const sw = Math.sin(ph) * stride, lift = Math.max(0, Math.cos(ph)) * L.lift * s * moving;
     const ftx = _hip.x + fx * sw, ftz = _hip.z + fz * sw, fty = gy + 0.02 * s + lift;
     const kx = ftx + fx * L.kneeF * s, ky = fty + L.knee * s, kz = ftz + fz * L.kneeF * s;
-    springTo(n.parts['lLeg' + S], ftx, fty + L.foot * s, ftz, 60, 9, T.velocity, k);
-    springTo(n.parts['uLeg' + S], (_hip.x + kx) / 2, (_hip.y + ky) / 2, (_hip.z + kz) / 2, 60, 9, T.velocity, k);
+    springTo(P['lLeg' + S], ftx, fty + L.foot * s, ftz, 60, 9, T.velocity, k);
+    springTo(P['uLeg' + S], (_hip.x + kx) / 2, (_hip.y + ky) / 2, (_hip.z + kz) / 2, 60, 9, T.velocity, k);
     _l.set(side * L.shX * s, L.shY * s, 0); T.pointToWorldFrame(_l, _sh);
     if (n.duel && side > 0 && !n.dance) duelArm(n, k);
     else if (n.dance) {
       const wave = Math.sin(n.danceT * 6 + side) * 0.12 * s;
-      springTo(n.parts['lArm' + S], _sh.x + fz * wave * side, _sh.y + L.armLo * 0.95 * s, _sh.z - fx * wave * side, 35, 6, T.velocity, k);
-      springTo(n.parts['uArm' + S], _sh.x, _sh.y + L.armHi * 0.93 * s, _sh.z, 35, 6, T.velocity, k);
+      springTo(P['lArm' + S], _sh.x + fz * wave * side, _sh.y + L.armLo * 0.95 * s, _sh.z - fx * wave * side, 35, 6, T.velocity, k);
+      springTo(P['uArm' + S], _sh.x, _sh.y + L.armHi * 0.93 * s, _sh.z, 35, 6, T.velocity, k);
     } else {
       const asw = -Math.sin(ph) * stride * 0.8;
-      springTo(n.parts['lArm' + S], _sh.x + fx * asw, _sh.y - L.armLo * s, _sh.z + fz * asw, 30, 6, T.velocity, k);
-      springTo(n.parts['uArm' + S], _sh.x + fx * asw * 0.35, _sh.y - L.armHi * s, _sh.z + fz * asw * 0.35, 30, 6, T.velocity, k);
+      springTo(P['lArm' + S], _sh.x + fx * asw, _sh.y - L.armLo * s, _sh.z + fz * asw, 30, 6, T.velocity, k);
+      springTo(P['uArm' + S], _sh.x + fx * asw * 0.35, _sh.y - L.armHi * s, _sh.z + fz * asw * 0.35, 30, 6, T.velocity, k);
     }
   }
 }
@@ -2107,6 +2113,109 @@ function stickMesh(mesh, hit) {
   } else stuck.push({ mesh, body: null });
   while (stuck.length > 60) { const s = stuck.shift(); disposeMesh(s.mesh); }
 }
+// ====================================================================
+//  Dismemberment and skewering (sharp melee weapons)
+// ====================================================================
+const SEVER_KIDS = { uArmL: ['lArmL'], uArmR: ['lArmR'], uLegL: ['lLegL'], uLegR: ['lLegR'] };
+const SEVER_AT = { head: 12, uArmL: 8, uArmR: 8, uLegL: 10, uLegR: 10, lArmL: 6, lArmR: 6, lLegL: 7, lLegR: 7 }; // cut needed (summed hit speeds, m/s)
+const SAY_LIMB = { arm: ['My arm!', 'Give that back!', 'I was using that!', 'That\'s not coming back, is it?'], leg: ['My leg!', 'I can\'t feel my leg!', 'Hop hop hop...', 'Who needs legs anyway?'] };
+// Sharp hits add up on a part; once a limb or the neck has taken enough, it comes off at its joint
+function cutNPC(n, key, v) {
+  if (!SEVER_AT[key] || n.removed || n.off?.has(key) || state.gore !== 2) return;
+  if (netFwd(n, 'cut', [key, v])) return;
+  if (!netMine(n)) return;
+  n.cut ||= {}; n.cut[key] = (n.cut[key] || 0) + v;
+  if (n.cut[key] >= SEVER_AT[key]) severNPC(n, key);
+}
+function severNPC(n, key, remote = false) {
+  if (n.removed || n.off?.has(key)) return;
+  const j = n.joints?.find(j => j.b === key); if (!j) return;
+  world.removeConstraint(j.c);
+  if (!n.off) { n.off = new Set(); n.liveParts = new Proxy(n.parts, { get: (o, k) => n.off.has(k) ? NOBODY : o[k] }); }
+  const sub = [key, ...(SEVER_KIDS[key] || [])]; sub.forEach(k => n.off.add(k));
+  if (n.skin) skinSplit(n, sub);
+  if (key.includes('Leg')) n.legless = true;
+  if (remote) return; // the owner sends the wounds and damage
+  if (net.on && n.nid) netSend({ t: 'sev', id: n.nid, k: key });
+  const pa = n.parts[j.a].pointToWorldFrame(new CANNON.Vec3(...j.pa)), pb = n.parts[key].pointToWorldFrame(new CANNON.Vec3(...j.pb));
+  const r = n.gore[key]?.maxR || 0.05;
+  woundNPC(n, j.a, V3(pa.x, pa.y, pa.z), 'hole', r * 1.2, { gibs: true });
+  woundNPC(n, key, V3(pb.x, pb.y, pb.z), 'hole', r * 1.2, { gibs: false });
+  n.bleed = 25; burst(V3(pa.x, pa.y, pa.z), 0xb01010, 30); bloodSplat(V3(pa.x, 0, pa.z), 0.6);
+  const lim = n.parts[key], away = lim.position.vsub(n.parts[j.a].position); away.normalize();
+  lim.velocity.vadd(away.scale(2.5), lim.velocity);
+  SFX.impact(12, lim.position, 'flesh');
+  if (key === 'head') { if (isFinite(n.health)) hurtNPC(n, n.health + 1); else n.state = 'dead'; }
+  else {
+    hurtNPC(n, key[0] === 'u' ? 30 : 18);
+    if (n.state !== 'dead') { speech.lastVoice = 0; npcSay(n, SAY_LIMB[key.includes('Leg') ? 'leg' : 'arm'][Math.floor(Math.random() * 4)], { urgent: true, long: true }); }
+    ragdoll(n, n.legless ? 1e6 : 2.5);
+  }
+}
+// Stop the skin stretching across a cut joint: each vertex goes wholly to the side it mostly belonged to
+function skinSplit(n, subKeys) {
+  const S = new Set(subKeys.map(k => RAG_PART_KEYS.indexOf(k)));
+  for (const m of n.skin.group.children) {
+    let g = m.geometry;
+    if (!m.userData.ownWeights) { // this ragdoll gets its own copy of the weights (the shape itself stays shared)
+      const g2 = new THREE.BufferGeometry();
+      for (const [k, a] of Object.entries(g.attributes)) g2.setAttribute(k, a);
+      g2.setIndex(g.index); for (const gr of g.groups) g2.addGroup(gr.start, gr.count, gr.materialIndex);
+      g2.setAttribute('skinWeight', g.attributes.skinWeight.clone()); g2.setAttribute('skinIndex', g.attributes.skinIndex.clone());
+      g2.userData.shared = true; m.geometry = g = g2; m.userData.ownWeights = true;
+    }
+    const si = g.attributes.skinIndex, sw = g.attributes.skinWeight;
+    for (let i = 0; i < si.count; i++) {
+      let a = 0, b = 0;
+      for (let c = 0; c < 4; c++) { const w = sw.getComponent(i, c); if (w > 0) { if (S.has(si.getComponent(i, c))) a += w; else b += w; } }
+      if (a > 0 && b > 0) {
+        const keepS = a >= b, tot = keepS ? a : b;
+        for (let c = 0; c < 4; c++) { const inS = S.has(si.getComponent(i, c)); sw.setComponent(i, c, inS === keepS ? sw.getComponent(i, c) / tot : 0); }
+      }
+    }
+    sw.needsUpdate = true;
+  }
+}
+// Skewering: a thrust along the blade, landing near the tip, pins the part onto the blade
+function skewerAim(ent, point, vel) {
+  const tipZ = ent.weapon.def.muzzle?.[2] ?? -0.8;
+  const fw = ent.body.quaternion.vmult(new CANNON.Vec3(0, 0, -1));
+  const along = vel.dot(fw), speed = vel.length();
+  const lp = ent.body.pointToLocalFrame(CV(point));
+  return along > 2.2 && along > speed * 0.6 && lp.z < tipZ * 0.12; // anywhere on the blade past the guard
+}
+function trySkewer(ent, n, part, point, vel) {
+  const w = ent.weapon; w.skewered ||= [];
+  if (w.skewered.length >= 3 || w.skewered.some(s => s.body === part) || !skewerAim(ent, point, vel)) return false;
+  const pl = part.pointToLocalFrame(CV(point)), pivB = new CANNON.Vec3(pl.x * 0.4, pl.y * 0.4, pl.z * 0.4); // through the middle of the part
+  const pa = ent.body.pointToLocalFrame(part.pointToWorldFrame(pivB));
+  if (!w.def.melee.zone) { pa.x = 0; pa.y = 0; pa.z = Math.min(pa.z, (w.def.muzzle?.[2] ?? -0.8) * 0.5); } // built-in blades: onto the blade, at least halfway up
+  const c = new CANNON.PointToPointConstraint(ent.body, pa, part, pivB, 3500);
+  c.collideConnected = false; addJoint(c, ent.body, part);
+  w.skewered.push({ c, body: part, npc: n });
+  (n.pins ||= []).push(c);
+  woundNPC(n, part.npcPart, point, 'hole', 0.035, { dir: vel });
+  hurtNPC(n, 20); ragdoll(n, 3);
+  if (n.state !== 'dead') { speech.lastVoice = 0; npcSay(n, ['Get me off this thing!', 'I\'m a kebab!', 'OW OW OW!', 'Put me down!'][Math.floor(Math.random() * 4)], { urgent: true, long: true }); }
+  return true;
+}
+// per frame: drop ragdolls that fell off, and fling them off with a hard flick (or a desktop slash)
+function skewerThink() {
+  for (const p of props) {
+    const w = p.weapon; if (!w?.skewered?.length) continue;
+    const spin = p.body.angularVelocity.length();
+    w.skewered = w.skewered.filter(s => {
+      const gone = s.npc.removed || !joints.some(j => j.c === s.c);
+      const fling = spin > 14 && p.heldBy;
+      if (gone || fling) {
+        if (!gone) { const k = joints.findIndex(j => j.c === s.c); world.removeConstraint(s.c); joints.splice(k, 1); s.body.velocity.vadd(p.body.velocity.scale(0.6), s.body.velocity); }
+        return false;
+      }
+      if (s.npc.state === 'active') ragdoll(s.npc, 1); // no walking off the blade
+      return true;
+    });
+  }
+}
 function meleeHit(ent, e) {
   const w = ent.weapon, M = w.def.melee;
   if (!ent.heldBy) return;
@@ -2125,7 +2234,9 @@ function meleeHit(ent, e) {
   if (other.ent?.type === 'npc' && v > 2.5) {
     w.lastHit = now;
     const vel = ent.body.velocity.clone(); const n = other.ent;
+    if (M.sharp && !netMine(n) && skewerAim(ent, point, vel)) netClaim(n); // take it over so it can sit on our blade
     if (!netMine(n)) { // their NPC: send the blow to its owner
+      if (M.sharp) cutNPC(n, other.npcPart, v);
       const d = V3(vel.x, vel.y, vel.z), sp = d.length() || 1;
       netSend({ t: 'hit', id: n.nid, pt: other.npcPart, p: R3(point), d: R3(d.multiplyScalar(1 / sp)), o: { dmg: v * M.dmg * 0.5, impulse: Math.min(80, sp * M.knock * 8) } });
       SFX.impact(v * 1.5, other.position, 'flesh'); hand?.pulse(0.9, 60);
@@ -2137,6 +2248,8 @@ function meleeHit(ent, e) {
       }
       hurtNPC(n, v * M.dmg * (other.npcPart === 'head' ? 1.6 : 1));
       ragdoll(n, 1 + v * 0.2);
+      if (M.sharp && trySkewer(ent, n, other, point, vel)) { SFX.impact(v * 1.5, other.position, 'flesh'); hand?.pulse(1, 90); return; }
+      if (M.sharp) cutNPC(n, other.npcPart, v);
       other.applyImpulse(vel.scale(M.knock * other.mass * 0.35));
       SFX.impact(v * 1.5, other.position, 'flesh'); burst(point, 0xb02020, 6); hand?.pulse(0.9, 60);
     });
@@ -2258,7 +2371,11 @@ const WEAPONS = [
       wpart(g, new THREE.ConeGeometry(0.025, 0.08, 4).rotateX(-Math.PI / 2).scale(1, 0.16, 1), wcol(0xdfe6ee, { m: 0.95, r: 0.15 }), 0, 0, -0.97);
       wpart(g, new THREE.SphereGeometry(0.025, 10, 8), wcol(0xc9a227, { m: 0.8 }), 0, 0, 0.13);
     },
-    fire(h) { h.swingT = SWING_T; SFX.whoosh(); },
+    swing: { style: 'combo' },
+    fire(h) { // slash, backhand, stab: the stab can skewer
+      h.comboN = (h.comboN || 0) + 1; h.swingStyle = ['slash', 'back', 'stab'][(h.comboN - 1) % 3]; h.swingAmp = 1;
+      h.swingT = h.swingDur = SWING_T * (h.swingStyle === 'stab' ? 0.85 : 1); SFX.whoosh();
+    },
   },
   {
     name: 'Baseball Bat', sub: 'Home-run knockback', mass: 1.0, melee: { dmg: 4, knock: 3.4 }, shapes: [{ size: [0.08, 0.08, 0.86], off: [0, 0, -0.33] }],
@@ -3667,8 +3784,8 @@ function duelArm(n, k) {
   else if (W.melee && n.duelPhase === 'strike') { lo = sh.clone().addScaledVector(d, 0.45 * s); hi = sh.clone().addScaledVector(d, 0.15 * s); kk = 110; }
   else if (W.melee) { lo = sh.clone().addScaledVector(d, 0.3 * s).addScaledVector(up, 0.06 * s); hi = sh.clone().addScaledVector(d, 0.1 * s).addScaledVector(up, -0.08 * s); }
   else { lo = sh.clone().addScaledVector(d, 0.45 * s); hi = sh.clone().addScaledVector(d, 0.15 * s); kk = 60; }
-  springTo(n.parts.lArmR, lo.x, lo.y, lo.z, kk, 7, T.velocity, k);
-  springTo(n.parts.uArmR, hi.x, hi.y, hi.z, kk, 7, T.velocity, k);
+  springTo((n.liveParts || n.parts).lArmR, lo.x, lo.y, lo.z, kk, 7, T.velocity, k);
+  springTo((n.liveParts || n.parts).uArmR, hi.x, hi.y, hi.z, kk, 7, T.velocity, k);
 }
 function duelMeleeStrike(n) {
   const W = duel.cur, D = duelDiff(), T = n.parts.torso.position;
@@ -4210,6 +4327,7 @@ function netReceive(P) {
       case 'cfg': net.pvp = !!m.pvp; net.hudDirty = true; menu.dirty = true; for (const p of net.peers.values()) p.tagDirty = true; toast(`PvP ${net.pvp ? 'on' : 'off'}`); break;
       case 'new': if (!m.ids.some(id => id && net.ents.has(id))) netCreateGroup(m.g, m.ids, m.ids.map(() => from), m.cols); break;
       case 'npc': if (!net.ents.has(m.id)) netMakeNPC(m.id, m.spec, from); break;
+      case 'sev': { const e = net.ents.get(m.id); if (e && !e.removed && e.type === 'npc' && SEVER_AT[m.k]) severNPC(e, m.k, true); break; }
       case 'say': { const e = net.ents.get(m.id); if (e && !e.removed && e.type === 'npc' && typeof m.s === 'string') npcSay(e, m.s.slice(0, 60), { remote: true, urgent: /!$/.test(m.s) }); break; }
       case 'rm': { const e = net.ents.get(m.id); if (e) { net.applying = true; try { removeEnt(e); } finally { net.applying = false; } } break; }
       case 'own': {
@@ -4229,6 +4347,7 @@ function netReceive(P) {
       case 'fx': {
         const e = net.ents.get(m.id); if (!e || e.removed || !netMine(e)) break;
         if (m.k === 'hurt') hurtNPC(e, m.a); else if (m.k === 'rag') ragdoll(e, m.a); else if (m.k === 'burn') ignite(e, m.a);
+        else if (m.k === 'cut' && Array.isArray(m.a)) cutNPC(e, m.a[0], +m.a[1] || 0);
         else if (m.k === 'freeze') freezeEnt(e); else if (m.k === 'twitch') twitch(e); else if (m.k === 'revive') reviveNPC(e);
         break;
       }
@@ -5275,7 +5394,7 @@ function syncVisuals(dt) {
     m.position.set(pp.x, pp.y, pp.z); m.quaternion.set(pq.x, pq.y, pq.z, pq.w);
   }
   for (const n of npcs) if (n.skin) ragSkinUpdate(n);
-  npcBubbles();
+  npcBubbles(); skewerThink();
   for (const bl of balloons) {
     const b = bl.body, bp = b.interpolatedPosition, bq = b.interpolatedQuaternion;
     const a = bq.vmult(bl.local).vadd(bp);
@@ -5341,5 +5460,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions, MODELS, makeWeapon, props };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions, MODELS, makeWeapon, props, severNPC, cutNPC, joints };
 </script>
