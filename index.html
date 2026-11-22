@@ -1673,16 +1673,43 @@ function detonate(ent) {
 // ====================================================================
 //  Effects
 // ====================================================================
+// Explosion lights are always in the scene, just switched off when unused. Adding or removing a light
+// changes the light count every shader is built for, which recompiled every material on screen and
+// froze the game for about a second on each explosion.
+// Compile shaders up front for effects that would otherwise first appear mid-fight (each first-time
+// shader can take a noticeable moment on Windows, where WebGL shaders are translated to Direct3D).
+// Runs in the background where the browser supports it.
+let warmGroup = null, warmKeep = null;
+function warmShaders() {
+  const g = warmGroup = new THREE.Group();
+  const geo = new THREE.BoxGeometry(0.01, 0.01, 0.01), temp = [
+    new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }), // explosion flash
+    new THREE.MeshStandardMaterial({ color: 0x55504a, transparent: true, depthWrite: false, roughness: 1 }),                   // smoke
+    new THREE.MeshStandardMaterial({ map: SPLAT_TEX[0], transparent: true, alphaTest: 0.04, depthWrite: false, polygonOffset: true }), // blood splatter
+    new THREE.SpriteMaterial({ map: SPLAT_TEX[0], transparent: true, depthWrite: false }),                                    // speech bubbles
+    new THREE.SpriteMaterial({ map: SPLAT_TEX[0], transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }),   // flames
+  ];
+  for (const m of [...gibMats, dropMat, ...Object.keys(GORE_COL).map(goreMat), ...temp]) g.add(m.isSpriteMaterial ? new THREE.Sprite(m) : new THREE.Mesh(geo, m));
+  // compile just these, lit and fogged like the real scene (not added to it). Synchronous on purpose:
+  // three.js 0.160's compileAsync can throw while polling, and this runs during a map load anyway.
+  try { renderer.compile(g, camera, scene); } catch (e) { console.warn('shader warm-up failed', e); }
+  // keep these materials alive: disposing them would delete the programs we just compiled
+  const old = warmKeep; warmKeep = { geo, temp }; warmGroup = null;
+  if (old) { old.geo.dispose(); old.temp.forEach(m => m.dispose()); }
+}
+const boomLights = [0, 1, 2].map(() => { const l = new THREE.PointLight(0xffa040, 0, 10, 2); fxGroup.add(l); return l; });
+let boomLightN = 0;
 function boomFX(pos, r) {
   const flash = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.9, depthWrite: false, blending: THREE.AdditiveBlending }));
   flash.position.copy(pos); fxGroup.add(flash);
-  const light = new THREE.PointLight(0xffa040, 60, r * 4, 2); light.position.copy(pos); fxGroup.add(light);
+  const light = boomLights[boomLightN++ % boomLights.length], id = boomLightN;
+  light.position.copy(pos); light.distance = r * 4; light.intensity = 60; light.userData.id = id;
   let t = 0;
   fx.push({ update(dt) {
     t += dt; const k = t / 0.45;
     flash.scale.setScalar(0.3 + r * 0.6 * Math.sqrt(k)); flash.material.opacity = 0.9 * (1 - k);
-    light.intensity = 60 * (1 - k);
-    if (k >= 1) { fxGroup.remove(flash, light); flash.geometry.dispose(); flash.material.dispose(); return false; }
+    if (light.userData.id === id) light.intensity = 60 * Math.max(0, 1 - k); // unless a newer blast took this light over
+    if (k >= 1) { fxGroup.remove(flash); flash.geometry.dispose(); flash.material.dispose(); return false; }
     return true;
   } });
   for (let i = 0; i < 10; i++) {
@@ -1909,6 +1936,7 @@ function loadMapLocal(i, gen, owner) {
   desk.yaw = 0; desk.pitch = 0;
   menu.dirty = true; updateHUD();
   toast(M.name);
+  warmShaders();
   } finally { net.applying = wasApplying; }
   net.gen = gen;
   if (net.on) {
@@ -5651,5 +5679,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions, MODELS, makeWeapon, props, severNPC, cutNPC, joints };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions, MODELS, makeWeapon, props, severNPC, cutNPC, joints, renderer, scene };
 </script>
