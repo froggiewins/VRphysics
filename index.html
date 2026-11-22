@@ -2231,11 +2231,16 @@ function upgradeModels() { // things that were spawned before the models finishe
     e.mesh.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
   }
 }
-new GLTFLoader().load(new URL('models/ragdoll-lab.glb', location.href).href, (gltf) => {
-  gltf.scene.traverse(o => { if (o.isMesh) { o.geometry.userData.shared = true; o.material.userData.shared = true; o.castShadow = o.receiveShadow = true; } });
-  for (const o of gltf.scene.children) { o.updateMatrixWorld(); MODELS[o.name] = o; }
-  upgradeModels();
-}, undefined, () => console.info('Ragdoll Lab: models/ragdoll-lab.glb not found, using built-in shapes'));
+// next to the page first (GitHub Pages, local server), then the copy in the GitHub repo via jsDelivr
+const MODEL_URLS = [new URL('models/ragdoll-lab.glb', location.href).href, 'https://cdn.jsdelivr.net/gh/froggiewins/VRphysics@d1a9127/models/ragdoll-lab.glb'];
+(function loadModels(i) {
+  if (i >= MODEL_URLS.length) { console.info('Ragdoll Lab: models not found, using built-in shapes'); return; }
+  new GLTFLoader().load(MODEL_URLS[i], (gltf) => {
+    gltf.scene.traverse(o => { if (o.isMesh) { o.geometry.userData.shared = true; o.material.userData.shared = true; o.castShadow = o.receiveShadow = true; } });
+    for (const o of gltf.scene.children) { o.updateMatrixWorld(); MODELS[o.name] = o; }
+    upgradeModels();
+  }, undefined, () => loadModels(i + 1));
+})(0);
 function makeWeapon(i, pos, quat) {
   const d = typeof i === 'number' ? WEAPONS[i] : i;
   const g = buildWeaponVisual(d, new THREE.Group());
