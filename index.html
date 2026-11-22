@@ -234,7 +234,7 @@ const SKINS = ['#f1c7a5', '#d9a27c', '#b47a54', '#8a5a3b', '#5c3a24', '#7cc576',
 const SKIN_NAMES = ['Light', 'Fair', 'Tan', 'Brown', 'Dark', 'Zombie', 'Alien'];
 
 const state = {
-  tool: 0, item: 0, time: 0, gravity: 3, paused: false, ai: true, map: 0, snap: true, gore: 2,
+  tool: 0, item: 0, time: 0, gravity: 3, paused: false, ai: true, map: 0, snap: true, gore: 2, voices: 2,
   npc: { shirt: 1, pants: 0, skin: 0, height: 1.8, behavior: 1, health: 1, random: false, name: '', body: null },
 };
 
@@ -1094,15 +1094,91 @@ function ragdoll(npc, t) {
   npc.ragTimer = Math.max(npc.ragTimer, t);
   npc.strength = 0;
 }
+// ====================================================================
+//  Ragdoll speech: speech bubbles over their heads, spoken with the browser's voice if it has one
+// ====================================================================
+const SAY = {
+  tease: ['Can\'t catch me!', 'Nyah nyah!', 'Is that all you\'ve got?', 'You throw like a noodle!', 'Come at me!', 'Bet you can\'t hit me!', 'Too slow!',
+    'Over here!', 'Boring!', 'Whatcha gonna do?', 'I\'m not scared of you!', 'You missed a spot!', 'My grandma hits harder!', 'Yawn...', 'Try and catch me!'],
+  up: ['Ha! Didn\'t even hurt!', 'Is that it?', 'Still standing!', 'Missed me!', 'You call that a hit?', 'Nice try!', 'I\'m back, baby!'],
+  ouch: ['Ouch!', 'Ow!', 'Oof!', 'Hey!', 'Owie!', 'Ow ow ow!', 'Rude!', 'Ack!'],
+  big: ['AAAH!', 'That really hurt!', 'OWWW!', 'Not cool!', 'My spleen!'],
+  fire: ['Hot hot hot!', 'I\'m on fire!', 'Put it out!', 'Ow, toasty!'],
+  flee: ['Eek!', 'Stay away!', 'Leave me alone!', 'Help!', 'Nope nope nope!'],
+  die: ['Ugh...', 'Goodbye, cruel world...', 'I regret nothing...', 'Bleh.'],
+};
+const VOICE_MODES = ['Voices: off', 'Voices: bubbles only', 'Voices: talk + bubbles'];
+const speech = { lastVoice: 0, lastTease: 0 };
+const sayPick = (k) => SAY[k][Math.floor(Math.random() * SAY[k].length)];
+function npcVoice(n) { // each ragdoll keeps one voice; picked from the browser's English voices
+  if (n.voice !== undefined) return n.voice;
+  const vs = (window.speechSynthesis?.getVoices() || []).filter(v => /^en/i.test(v.lang));
+  n.vp = rand(-0.25, 0.25);
+  return (n.voice = vs.length ? vs[Math.floor(Math.random() * vs.length)] : null);
+}
+function npcSay(n, text, o = {}) {
+  if (!state.voices || !n || n.removed) return;
+  if (net.on && n.nid && netMine(n) && !o.remote) netSend({ t: 'say', id: n.nid, s: text });
+  // bubble
+  if (!n.bubble) {
+    const cv = document.createElement('canvas'); cv.width = 512; cv.height = 96;
+    const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+    sp.renderOrder = 5; fxGroup.add(sp);
+    n.bubble = { sp, cv, tex, until: 0 };
+  }
+  const b = n.bubble, g = b.cv.getContext('2d');
+  g.clearRect(0, 0, 512, 96);
+  g.font = '700 40px "Chakra Petch", sans-serif';
+  const w = Math.min(500, g.measureText(text).width + 44), x0 = (512 - w) / 2;
+  g.fillStyle = 'rgba(255,255,255,0.95)'; g.strokeStyle = '#1d1f24'; g.lineWidth = 5;
+  g.beginPath(); g.roundRect(x0, 6, w, 66, 22); g.moveTo(244, 72); g.lineTo(256, 92); g.lineTo(270, 72); g.fill(); g.stroke();
+  g.fillStyle = '#1d1f24'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 256, 40, 480);
+  b.tex.needsUpdate = true; b.until = performance.now() + (o.long ? 2800 : 2000);
+  const k = 0.55 * Math.max(0.7, Math.min(1.6, n.s)); b.sp.scale.set(k * 512 / 96 * 0.5, k * 0.5, 1); b.sp.visible = true;
+  // voice
+  const ss = window.speechSynthesis;
+  if (state.voices < 2 || !ss) return;
+  const d = n.parts.torso.position.distanceTo(headPos), now = performance.now();
+  if (d > 16) return;
+  if (o.urgent) { if (now - speech.lastVoice < 350) return; if (ss.speaking) ss.cancel(); }
+  else if (ss.speaking || ss.pending) return;
+  speech.lastVoice = now;
+  const u = new SpeechSynthesisUtterance(text), v = npcVoice(n);
+  if (v) u.voice = v;
+  u.pitch = clamp(1.2 / Math.sqrt(n.s) + n.vp, 0.3, 2); u.rate = o.urgent ? 1.3 : 1.12; u.volume = clamp(1 - d / 16, 0.15, 1);
+  ss.speak(u);
+}
+function npcBubbles() {
+  const now = performance.now();
+  for (const n of npcs) {
+    const b = n.bubble; if (!b || !b.sp.visible) continue;
+    if (now > b.until) { b.sp.visible = false; continue; }
+    const h = n.meshes.head.position;
+    b.sp.position.set(h.x, h.y + 0.38 * n.s, h.z);
+    b.sp.material.opacity = Math.min(1, (b.until - now) / 350);
+  }
+}
+// "Ouch" and friends when hurt: louder lines for big hits, hot lines when burning
+function npcOuch(n, dmg) {
+  const now = performance.now();
+  if (dmg < 0.5 && !(n.burn > 0)) return;
+  if (now - (n.ouchT || 0) < (n.burn > 0 ? 1600 : 700)) return;
+  n.ouchT = now;
+  npcSay(n, sayPick(n.burn > 0 ? 'fire' : dmg >= 25 ? 'big' : 'ouch'), { urgent: true });
+}
 function hurtNPC(npc, dmg) {
   if (netFwd(npc, 'hurt', dmg) || !netMine(npc)) return;
-  if (npc.removed || npc.state === 'dead' || !isFinite(npc.health)) return;
+  if (npc.removed || npc.state === 'dead') return;
+  npcOuch(npc, dmg);
+  if (!isFinite(npc.health)) return;
   npc.health -= dmg;
   if (performance.now() - npc.hurtT > 400) { npc.hurtT = performance.now(); SFX.hurt(npc.parts.torso.position); }
   if (npc.health <= 0) {
     npc.health = 0; npc.state = 'dead';
     for (const m of Object.values(npc.meshes)) if (m.userData.role === 'skin') m.material.color.lerp(new THREE.Color(0x8a9a88), 0.5);
     npc.eyes?.forEach((e, i) => { if (i < 2) e.scale.set(1.6, 0.3, 1); });
+    speech.lastVoice = 0; npcSay(npc, sayPick('die'), { urgent: true, long: true });
   }
 }
 function reviveNPC(npc) {
@@ -1136,7 +1212,11 @@ function npcThink(n, dt) {
   if (n.state === 'dead') return;
   if (n.state === 'ragdoll') {
     n.ragTimer -= dt;
-    if (n.ragTimer <= 0 && T.velocity.length() < 2.5) { n.state = 'active'; n.strength = 0; }
+    if (n.ragTimer <= 0 && T.velocity.length() < 2.5) {
+      n.state = 'active'; n.strength = 0;
+      // back on their feet near you: rub it in
+      if (state.ai && n.behavior !== 3 && Math.random() < 0.6 && T.position.distanceTo(headPos) < 10) later(1.2, () => { if (n.state === 'active') { npcSay(n, sayPick('up')); n.teaseT = 1.4; } });
+    }
     return;
   }
   n.strength = Math.min(1, n.strength + dt * 0.7);
@@ -1174,13 +1254,28 @@ function npcThink(n, dt) {
       n.yaw = wrapAngle(n.yaw + dt * 1.6);
       break;
   }
+  // teasing: now and then, when you're close, stop, face you, wiggle and say something cheeky
+  n.teaseCd = (n.teaseCd ?? rand(2, 6)) - dt;
+  if (state.voices && ai && !(n.burn > 0) && n.teaseCd <= 0 && dist < (n.duel ? 10 : 6)) {
+    n.teaseCd = rand(7, 14);
+    const now = performance.now();
+    if (now - speech.lastTease > 2500) {
+      speech.lastTease = now;
+      if (n.behavior === 3 && !n.duel) npcSay(n, sayPick('flee'));
+      else { npcSay(n, sayPick('tease')); n.teaseT = 1.6; }
+    }
+  }
+  if (n.teaseT > 0) {
+    n.teaseT -= dt;
+    if (!n.duel) { speed = 0; dirx = dirz = 0; n.yaw = Math.atan2(dx, dz); }
+  }
   if (speed > 0) n.yaw = Math.atan2(dirx, dirz);
   if (n.duel && n.duelFace && !(n.burn > 0)) n.yaw = Math.atan2(dx, dz); // strafing and backing off while facing you
   const sm = n.L ? n.L.speed : 1;
   n.vd.set(dirx * speed * n.s * sm, 0, dirz * speed * n.s * sm);
   const hs = Math.hypot(T.velocity.x, T.velocity.z);
   n.phase += dt * hs * (Math.PI * 2) / ((n.L ? n.L.step : 1.1) * n.s);
-  n.dance = n.duel ? !!n.duelDance : ai && n.behavior === 4;
+  n.dance = n.duel ? !!n.duelDance : (ai && n.behavior === 4) || n.teaseT > 0;
   n.danceT = (n.danceT || 0) + dt;
 }
 
@@ -1281,6 +1376,7 @@ function removeEnt(ent) {
     for (const b of Object.values(ent.parts)) detachBody(b);
     for (const m of Object.values(ent.meshes)) disposeMesh(m);
     if (ent.skin) disposeMesh(ent.skin.group);
+    if (ent.bubble) { ent.bubble.tex.dispose(); ent.bubble.sp.material.dispose(); ent.bubble.sp.parent?.remove(ent.bubble.sp); }
     npcs.splice(npcs.indexOf(ent), 1);
   } else {
     detachBody(ent.body); disposeMesh(ent.mesh);
@@ -4114,6 +4210,7 @@ function netReceive(P) {
       case 'cfg': net.pvp = !!m.pvp; net.hudDirty = true; menu.dirty = true; for (const p of net.peers.values()) p.tagDirty = true; toast(`PvP ${net.pvp ? 'on' : 'off'}`); break;
       case 'new': if (!m.ids.some(id => id && net.ents.has(id))) netCreateGroup(m.g, m.ids, m.ids.map(() => from), m.cols); break;
       case 'npc': if (!net.ents.has(m.id)) netMakeNPC(m.id, m.spec, from); break;
+      case 'say': { const e = net.ents.get(m.id); if (e && !e.removed && e.type === 'npc' && typeof m.s === 'string') npcSay(e, m.s.slice(0, 60), { remote: true, urgent: /!$/.test(m.s) }); break; }
       case 'rm': { const e = net.ents.get(m.id); if (e) { net.applying = true; try { removeEnt(e); } finally { net.applying = false; } } break; }
       case 'own': {
         const e = net.ents.get(m.id); if (!e || e.removed) break;
@@ -4495,6 +4592,7 @@ function drawMenu() {
     const G = GRAVITIES[state.gravity];
     stepper(164, 'Gravity', `${G.name} ${Math.abs(G.g).toFixed(2)}`, () => { state.gravity = cyc(state.gravity, GRAVITIES.length, -1); applyGravity(); }, () => { state.gravity = cyc(state.gravity, GRAVITIES.length, 1); applyGravity(); });
     stepper(234, 'Time', TIMES[state.time].name, () => state.time = cyc(state.time, TIMES.length, -1), () => state.time = cyc(state.time, TIMES.length, 1));
+    mbtn(610, 164, 382, 60, VOICE_MODES[state.voices], () => { state.voices = cyc(state.voices, 3, 1); if (state.voices < 2) window.speechSynthesis?.cancel(); }, { active: state.voices > 0, size: 21, sub: 'Ragdolls tease you and yell when hurt' });
     mbtn(32, 318, 470, 66, state.paused ? 'Physics: paused' : 'Physics: running', () => state.paused = !state.paused, { active: state.paused, size: 24 });
     mbtn(522, 318, 470, 66, state.ai ? 'NPC brains: on' : 'NPC brains: off', () => state.ai = !state.ai, { active: !state.ai, size: 24 });
     mbtn(32, 398, 310, 66, 'Clear props', () => clearProps(), { size: 24 });
@@ -5177,6 +5275,7 @@ function syncVisuals(dt) {
     m.position.set(pp.x, pp.y, pp.z); m.quaternion.set(pq.x, pq.y, pq.z, pq.w);
   }
   for (const n of npcs) if (n.skin) ragSkinUpdate(n);
+  npcBubbles();
   for (const bl of balloons) {
     const b = bl.body, bp = b.interpolatedPosition, bq = b.interpolatedQuaternion;
     const a = bq.vmult(bl.local).vadd(bp);
