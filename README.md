@@ -44,4 +44,14 @@ Finished weapons are equipped straight away and saved in your browser, listed un
 
 Built with three.js and cannon-es, loaded from the jsDelivr CDN. No build step.
 
+## Models
+
+The 12 weapons, the rocket, the barrel and the bomb are modelled in Blender and loaded from `models/ragdoll-lab.glb`. If that file is missing, the game falls back to simple built-in shapes. The models are made by a script, so to change them, edit `blender/build_models.py` and run:
+
+```
+blender --background --factory-startup --python blender/build_models.py -- models/ragdoll-lab.glb blender/preview.png
+```
+
+The script works in the game's own coordinates (Y up, −Z forward, metres, origin at the hand), so models line up with the existing grips, muzzles and physics shapes.
+
 

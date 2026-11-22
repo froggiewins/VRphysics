@@ -106,12 +106,19 @@ kbd { font: 600 0.85em var(--display); background: #0b0f14; border: 1px solid va
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
   "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
 } }
 </script>
 <script type="module">
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Models made in Blender (blender/build_models.py) live in models/ragdoll-lab.glb. Until they load,
+// or if the file is missing, everything uses the simple built-in shapes.
+const MODELS = {};
+const modelKey = (s) => THREE.PropertyBinding.sanitizeNodeName(s);
 
 // ====================================================================
 //  Renderer, scene, rig
@@ -450,7 +457,8 @@ function sphereProp(pos, r, mass, o = {}) {
 function cylProp(pos, r, h, mass, o = {}) {
   const m = new THREE.MeshStandardMaterial({ color: o.color ?? 0xffffff, map: o.map || null, roughness: o.rough ?? 0.6, metalness: o.metal ?? 0 });
   const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 18), m);
-  return makeProp({ shapes: [{ shape: new CANNON.Cylinder(r, r, h, 14) }], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'cyl', sound: o.sound, name: o.name });
+  const ent = makeProp({ shapes: [{ shape: new CANNON.Cylinder(r, r, h, 14) }], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'cyl', sound: o.sound, name: o.name });
+  return o.kind === 'barrel' && Math.abs(r - 0.3) < 1e-3 && Math.abs(h - 0.9) < 1e-3 ? dressBarrel(ent) : ent;
 }
 function addJoint(c, a, b) { world.addConstraint(c); joints.push({ c, a, b }); }
 
@@ -459,7 +467,7 @@ function makeBomb(pos) {
   const fuse = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.12, 8), new THREE.MeshStandardMaterial({ color: 0x553311, emissive: 0xff3300, emissiveIntensity: 1 }));
   fuse.position.y = 0.27; ent.mesh.add(fuse);
   ent.bomb = true; ent.fuse = fuse;
-  return ent;
+  return dressBomb(ent);
 }
 function makeCart(pos, yaw) {
   const q = quatYawTilt(yaw, 0);
@@ -1191,7 +1199,7 @@ function detachBody(b) {
   for (const h of hands) if (h.ropeStart && h.ropeStart.body === b) h.ropeStart = null;
   world.removeBody(b);
 }
-function disposeMesh(m) { m.traverse(o => { if (o.isMesh) { o.geometry.dispose(); if (!o.userData.innard || !Object.values(goreMats).includes(o.material)) o.material.dispose?.(); } }); m.parent?.remove(m); }
+function disposeMesh(m) { m.traverse(o => { if (o.isMesh) { if (!o.geometry.userData.shared) o.geometry.dispose(); if (o.material?.userData?.shared) return; if (!o.userData.innard || !Object.values(goreMats).includes(o.material)) o.material.dispose?.(); } }); m.parent?.remove(m); }
 function removeEnt(ent) {
   if (!ent || ent.removed || ent.type === 'avatar') return;
   ent.removed = true;
@@ -1904,6 +1912,7 @@ function fireProjectile(o) {
   o.mesh.position.copy(o.pos); o.mesh.lookAt(o.pos.clone().add(o.vel)); fxGroup.add(o.mesh);
 }
 function rocketMesh() {
+  if (MODELS.W_Rocket) return MODELS.W_Rocket.clone(true);
   const g = new THREE.Group();
   wpart(g, zcyl(0.045, 0.045, 0.4), wcol(0x5d6b3a, { r: 0.6 }), 0, 0, 0);
   wpart(g, new THREE.ConeGeometry(0.045, 0.14, 12).rotateX(Math.PI / 2), wcol(0xc0392b), 0, 0, 0.27);
@@ -2183,9 +2192,53 @@ const WEAPONS = [
     },
   },
 ];
+// ---- Blender models: load, then swap them in for the built-in shapes ----
+function buildWeaponVisual(d, g) {
+  const t = !d.custom && MODELS['W_' + modelKey(d.name)];
+  if (!t) { d.build(g); return g; }
+  for (const c of t.clone(true).children.slice()) g.add(c);
+  if (d.name === 'Grenade') { // its own LED material, since the fuse blinks it
+    const led = g.getObjectByName('LED'); led.material = wcol(0x330000, { e: 0x000000 }); g.userData.led = led;
+  }
+  if (d.name === 'Crossbow') { const bolt = boltMesh(); bolt.rotation.y = Math.PI; bolt.position.set(0, 0.05, -0.3); g.add(bolt); g.userData.loaded = bolt; }
+  return g;
+}
+function dressBarrel(ent) {
+  const body = MODELS.P_Barrel?.getObjectByName('Barrel_Body');
+  if (!body || ent.dressed) return ent;
+  ent.dressed = true;
+  ent.mesh.geometry.dispose(); ent.mesh.geometry = body.geometry;
+  ent.mesh.add(MODELS.P_BarrelTrim.clone(true));
+  return ent;
+}
+function dressBomb(ent) {
+  if (!MODELS.P_BombCap || ent.dressed) return ent;
+  ent.dressed = true;
+  ent.mesh.add(MODELS.P_BombCap.clone(true));
+  if (ent.fuse) ent.fuse.position.y = 0.34;
+  return ent;
+}
+function upgradeModels() { // things that were spawned before the models finished loading
+  for (const e of props) {
+    if (e.removed) continue;
+    if (e.kind === 'barrel') dressBarrel(e);
+    else if (e.bomb) dressBomb(e);
+    else if (e.weapon && !e.weapon.def.custom && MODELS['W_' + modelKey(e.weapon.def.name)]) {
+      const g = e.mesh;
+      for (const c of g.children.slice()) disposeMesh(c);
+      buildWeaponVisual(e.weapon.def, g); e.weapon.def.init?.(e, g);
+    }
+    e.mesh.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  }
+}
+new GLTFLoader().load(new URL('models/ragdoll-lab.glb', location.href).href, (gltf) => {
+  gltf.scene.traverse(o => { if (o.isMesh) { o.geometry.userData.shared = true; o.material.userData.shared = true; o.castShadow = o.receiveShadow = true; } });
+  for (const o of gltf.scene.children) { o.updateMatrixWorld(); MODELS[o.name] = o; }
+  upgradeModels();
+}, undefined, () => console.info('Ragdoll Lab: models/ragdoll-lab.glb not found, using built-in shapes'));
 function makeWeapon(i, pos, quat) {
   const d = typeof i === 'number' ? WEAPONS[i] : i;
-  const g = new THREE.Group(); d.build(g);
+  const g = buildWeaponVisual(d, new THREE.Group());
   const shapes = d.shapes.map(s => ({
     shape: s.r ? new CANNON.Sphere(s.r) : s.cyl ? new CANNON.Cylinder(s.cyl[0], s.cyl[1], s.cyl[2], 10) : new CANNON.Box(new CANNON.Vec3(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2)),
     offset: new CANNON.Vec3(...(s.off || [0, 0, 0])), quat: s.q ? new CANNON.Quaternion(...s.q) : undefined }));
@@ -3268,7 +3321,7 @@ function duelStart() {
   const n = createNPC(V3(p.x, gy + 0.02, p.z), Math.atan2(-fwd.x, -fwd.z), { shirt: '#7a1f2b', pants: '#1b1b1b', skin: SKINS[2], height: 1.85, behavior: 0, health: D.hp });
   Object.assign(n, { name: 'Duelist', duel: true, duelCd: 1.6, duelPhase: null, strafe: 1, strafeT: 0 });
   if (W.model) { // the weapon it carries (just for show: its attacks are simulated)
-    const g = new THREE.Group(); WEAPON_BY_NAME(W.model).build(g);
+    const g = buildWeaponVisual(WEAPON_BY_NAME(W.model), new THREE.Group());
     g.position.set(0, -0.15 * n.s, 0); g.rotation.x = -Math.PI / 2;
     g.traverse(o => { if (o.isMesh) o.castShadow = true; });
     n.meshes.lArmR.add(g);
@@ -5031,5 +5084,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions, MODELS, makeWeapon, props };
 </script>
