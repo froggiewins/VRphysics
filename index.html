@@ -936,6 +936,7 @@ function createNPC(pos, yaw, o) {
     gore: {}, bleed: 0,
   };
   const lay = npcLayout(o.body);
+  const drawn = lay.b.draw?.strokes?.length ? lay.b.draw : null, hideBody = !!drawn?.hide;
   npc.L = lay.L; npc.body = o.body ? { ...lay.b } : null;
   if (o.name) npc.name = o.name;
   npc.spec = { p: R3(pos), yaw, o: { shirt: o.shirt, pants: o.pants, skin: o.skin, height: o.height, behavior: o.behavior, health: isFinite(o.health) ? o.health : -1, ...(o.body ? { body: npc.body } : {}), ...(o.name ? { name: o.name } : {}) } };
@@ -956,8 +957,10 @@ function createNPC(pos, yaw, o) {
     mesh.userData = { kind: 'npc', ent: npc, body, role: P.role, baseEmissive: 0 };
     mesh.position.copy(wp); mesh.quaternion.copy(q);
     dynGroup.add(mesh);
-    if (key === 'head') { npc.eyes = npcFace(mesh, lay, s, o.skin); npcHeadwear(mesh, lay, s); }
-    if (key === 'lLegL' || key === 'lLegR') {
+    if (drawn) for (const st of drawn.strokes) if (st.p === key) mesh.add(ragStrokeMesh(st, s));
+    if (hideBody) mat.visible = false; // only the drawing shows; the physics body is still there
+    else if (key === 'head') { npc.eyes = npcFace(mesh, lay, s, o.skin); npcHeadwear(mesh, lay, s); }
+    if (!hideBody && (key === 'lLegL' || key === 'lLegR')) {
       const t = lay.b.legT, f = lay.b.leg;
       const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.13 * s * t, 0.07 * s * Math.sqrt(t), 0.22 * s * Math.sqrt(t * f)), new THREE.MeshStandardMaterial({ color: ACC_COLS[lay.b.shoes] || 0x1b1b1b, roughness: 0.6 }));
       shoe.position.set(0, (-lay.LL + 0.035 * Math.sqrt(t) - 0.005) * s, 0.04 * s * Math.sqrt(t * f)); shoe.castShadow = true; mesh.add(shoe);
@@ -2328,7 +2331,7 @@ function clearWeaponFX() {
 //  Weapon Workshop: air-draw a weapon, pick ranged or melee, mark the grip
 //  and the damaging part, then it becomes a real weapon you can hold
 // ====================================================================
-const WS_COLORS = ['#d9dee6', '#2b3038', '#c0392b', '#e8a23a', '#36b37e', '#2f7fe0', '#8e5bd6', '#8a5a2b'];
+const WS_COLORS = ['#d9dee6', '#2b3038', '#c0392b', '#e8a23a', '#36b37e', '#2f7fe0', '#8e5bd6', '#8a5a2b', '#f1c7a5', '#b47a54', '#5c3a24', '#ff7eb6', '#f5e04a', '#ffffff', '#111111'];
 const WS_THICK = [{ name: 'Thin', r: 0.008 }, { name: 'Medium', r: 0.015 }, { name: 'Thick', r: 0.026 }];
 const WS_AMMO = ['Bullets', 'Laser', 'Rockets', 'Scatter', 'Flames', 'Lightning', 'Sticky bolts', 'Freeze shot', 'Grenades', 'Bouncy balls'];
 const WS_AMMO_RATE = [0.2, 0.2, 1.0, 0.6, 0.035, 0.11, 0.9, 0.3, 0.7, 0.25];
@@ -2363,7 +2366,8 @@ const WS_NAME_B = ['Stick', 'Blaster', 'Bonker', 'Cannon', 'Slicer', 'Zapper', '
 const wsRandomName = () => WS_NAME_A[Math.floor(Math.random() * WS_NAME_A.length)] + ' ' + WS_NAME_B[Math.floor(Math.random() * WS_NAME_B.length)];
 const tuneDefaults = () => Object.fromEntries(Object.entries(WS_TUNE).map(([k, t]) => [k, t.def]));
 const tuneVal = (tune, k) => WS_TUNE[k].opts[clamp(tune?.[k] ?? WS_TUNE[k].def, 0, WS_TUNE[k].opts.length - 1)][1];
-const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, tool: 0, preview: null, kind: null, ammo: 0, auto: false, mode: 0, tune: tuneDefaults(), name: '', grip: null, muzzles: [], zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false };
+const ws = { active: false, step: 'draw', strokes: [], color: 0, thick: 1, tool: 0, preview: null, kind: null, ammo: 0, auto: false, mode: 0, tune: tuneDefaults(), name: '', grip: null, muzzles: [], zone: new Set(), center: V3(), group: null, orbitDist: 1.4, saveRig: V3(), msg: '', marksDirty: false,
+  rag: false, ragMirror: true, ragAttach: 0, ragHide: false, ghost: null };
 const launchedBalls = [];
 const customWeapons = []; // { data, def }
 let customCounter = 0;
@@ -2623,25 +2627,174 @@ function customDef(data) {
   };
 }
 
-function wsStart() {
+// ====================================================================
+//  Ragdoll drawing: draw in the air on a ghost ragdoll. Each bit of a stroke sticks to the
+//  body part it's closest to, stored relative to that part (in metres for a 1.8 m figure).
+// ====================================================================
+const RAG_PART_KEYS = ['torso', 'head', 'uArmL', 'lArmL', 'uArmR', 'lArmR', 'uLegL', 'lLegL', 'uLegR', 'lLegR'];
+const RAG_PART_NAMES = ['Body', 'Head', 'Left upper arm', 'Left forearm', 'Right upper arm', 'Right forearm', 'Left thigh', 'Left shin', 'Right thigh', 'Right shin'];
+let ragHover = null;
+const ragMirrorKey = (k) => k && (k.endsWith('L') ? k.slice(0, -1) + 'R' : k.endsWith('R') ? k.slice(0, -1) + 'L' : k);
+const ragToL = (w) => w.clone().sub(ws.ghost.origin).applyQuaternion(ws.ghost.qi).multiplyScalar(1 / ws.ghost.k);
+const ragToW = (l) => l.clone().multiplyScalar(ws.ghost.k).applyQuaternion(ws.ghost.q).add(ws.ghost.origin);
+function ragMirrorW(w) { const l = ragToL(w); l.x = -l.x; return ragToW(l); }
+function ragMirrorSh(sh) {
+  const g = ws.ghost, ql = g.qi.clone().multiply(sh.q);
+  const qm = g.q.clone().multiply(new THREE.Quaternion(ql.x, -ql.y, -ql.z, ql.w));
+  return { t: sh.t, pos: ragMirrorW(sh.pos), q: qm, size: sh.size.slice() };
+}
+// distance from a figure-space point to a body part (negative inside)
+function ragDist(l, p) {
+  const dx = l.x - p.x, dy = l.y - p.y, dz = l.z;
+  if (p.r) return Math.hypot(dx, dy, dz) - p.r;
+  const qx = Math.abs(dx) - p.he[0], qy = Math.abs(dy) - p.he[1], qz = Math.abs(dz) - p.he[2];
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0);
+}
+function ragPartAt(l, lock) {
+  if (lock) return lock;
+  let best = 'torso', bd = Infinity;
+  for (const [k, p] of Object.entries(ws.ghost.lay.P)) { const d = ragDist(l, p); if (d < bd) { bd = d; best = k; } }
+  return best;
+}
+function ragStrokeMesh(st, s) {
+  const V = (a) => V3(a[0] * s, a[1] * s, a[2] * s);
+  if (st.sh) return shapeMesh({ t: st.sh.t, pos: V(st.sh.p), q: new THREE.Quaternion().fromArray(st.sh.q), size: st.sh.s.map(v => v * s) }, st.c);
+  return strokeMesh(st.pts.map(V), Math.max(0.004, st.r * s), st.c);
+}
+// See-through copy of the current design, 1 m tall, facing you, feet on the grid
+function ragGhostStart(head) {
+  const n = state.npc, lay = npcLayout(n.body), P = lay.P;
+  const k = 1.0 / (P.head.y + lay.hd[1]);
+  const to = head.clone().sub(ws.center); to.y = 0; if (to.lengthSq() < 1e-4) to.set(0, 0, 1);
+  const q = new THREE.Quaternion().setFromAxisAngle(V3(0, 1, 0), Math.atan2(to.x, to.z));
+  const origin = ws.center.clone(); origin.y -= 0.5;
+  if (!renderer.xr.isPresenting) origin.addScaledVector(V3(to.z, 0, -to.x).normalize(), 0.3); // desktop: clear of the panel on the left
+  const g = ws.ghost = { lay, k, q, qi: q.clone().invert(), origin, meshes: {} };
+  const grid = new THREE.GridHelper(1.2, 12, 0x3fd0c9, 0x2a3646); grid.position.copy(origin); grid.quaternion.copy(q);
+  grid.material.transparent = true; grid.material.opacity = 0.5; ws.group.add(grid);
+  const grp = new THREE.Group(); grp.position.copy(origin); grp.quaternion.copy(q); grp.scale.setScalar(k);
+  const cols = { shirt: SHIRTS[n.shirt], pants: PANTS[n.pants], skin: SKINS[n.skin] };
+  for (const [key, p] of Object.entries(P)) {
+    const geo = p.r ? new THREE.SphereGeometry(p.r, 20, 14) : new THREE.BoxGeometry(p.he[0] * 2, p.he[1] * 2, p.he[2] * 2);
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: cols[p.role], transparent: true, opacity: 0.2, depthWrite: false }));
+    m.position.set(p.x, p.y, 0);
+    const e = new THREE.LineSegments(new THREE.EdgesGeometry(p.r ? new THREE.SphereGeometry(p.r, 10, 6) : geo, p.r ? 25 : 1), new THREE.LineBasicMaterial({ color: 0x3fd0c9, transparent: true, opacity: 0.45 }));
+    m.add(e); m.userData.edge = e; grp.add(m); g.meshes[key] = m;
+  }
+  ws.group.add(grp);
+  // bring back the drawing this design already has, so you can keep working on it
+  const d = n.body?.draw;
+  ws.ragHide = !!d?.hide;
+  for (const st of d?.strokes || []) {
+    const p = P[st.p]; if (!p) continue;
+    const W = (a) => ragToW(V3(a[0] + p.x, a[1] + p.y, a[2]));
+    const s = { color: st.c, r: (st.r || 0.01) * k, mesh: null, dirty: true, lock: st.p };
+    if (st.sh) { s.sh = { t: st.sh.t, pos: W(st.sh.p), q: q.clone().multiply(new THREE.Quaternion().fromArray(st.sh.q)), size: st.sh.s.map(v => v * k) }; s.pts = [s.sh.pos.clone()]; }
+    else s.pts = st.pts.map(W);
+    ws.strokes.push(s);
+  }
+}
+function ragGhostShade() {
+  const lock = ws.ragAttach ? RAG_PART_KEYS[ws.ragAttach - 1] : null;
+  for (const [k, m] of Object.entries(ws.ghost.meshes)) {
+    const on = k === (ragHover || lock);
+    m.material.opacity = on ? 0.5 : ws.ragHide ? 0.05 : 0.2;
+    m.userData.edge.material.opacity = on ? 1 : 0.45;
+    m.userData.edge.material.color.set(on ? 0xffb020 : 0x3fd0c9);
+  }
+}
+// Turn the strokes into part-relative data; thins the points out if there are too many to send online
+function ragBuildDraw() {
+  const g = ws.ghost, P = g.lay.P, r3 = (v) => +v.toFixed(3);
+  for (let sp = 0.012; ; sp *= 1.5) {
+    const out = []; let total = 0;
+    for (const s of ws.strokes) {
+      if (s.twinOf) { // drawn across the middle: skip the mirrored copy if it lands on top of the original
+        const a = s.sh ? [s.sh.pos] : s.pts, b = s.twinOf.sh ? [s.twinOf.sh.pos] : s.twinOf.pts, tol = 0.03 * g.k;
+        if (a.every(w => b.some(v => v.distanceTo(w) < tol))) continue;
+      }
+      let pts = s.pts, rad = s.r;
+      if (s.sh?.t === 'cyl' && !s.lock) { // a tube across a joint becomes a bendy line so it flexes with the limb
+        const ax = V3(0, 1, 0).applyQuaternion(s.sh.q).multiplyScalar(s.sh.size[1] / 2);
+        const A = s.sh.pos.clone().sub(ax), B = s.sh.pos.clone().add(ax);
+        if (ragPartAt(ragToL(A)) !== ragPartAt(ragToL(B))) {
+          const m = Math.max(2, Math.ceil(A.distanceTo(B) / 0.006));
+          pts = Array.from({ length: m + 1 }, (_, i) => A.clone().lerp(B, i / m)); rad = s.sh.size[0];
+        }
+      }
+      if (s.sh && pts === s.pts) {
+        const l = ragToL(s.sh.pos), key = ragPartAt(l, s.lock), p = P[key];
+        out.push({ p: key, c: s.color, sh: { t: s.sh.t, p: [r3(l.x - p.x), r3(l.y - p.y), r3(l.z)], q: g.qi.clone().multiply(s.sh.q).toArray().map(v => +v.toFixed(4)), s: s.sh.size.map(v => r3(v / g.k)) } });
+        total += 4; continue;
+      }
+      const ls = [];
+      pts.forEach((w, i) => {
+        const l = ragToL(w), d = ls.length ? l.distanceTo(ls[ls.length - 1]) : Infinity;
+        if (d >= sp || (i === pts.length - 1 && d > 0.003)) ls.push(l);
+      });
+      const runs = []; let run = null;
+      for (const l of ls) { // split the stroke where it crosses onto another part
+        const key = ragPartAt(l, s.lock);
+        if (!run || run.key !== key) { const prev = run?.pts[run.pts.length - 1]; run = { key, pts: prev ? [prev] : [] }; runs.push(run); }
+        run.pts.push(l);
+      }
+      for (const rn of runs) {
+        const p = P[rn.key]; total += rn.pts.length;
+        out.push({ p: rn.key, c: s.color, r: r3(rad / g.k), pts: rn.pts.map(l => [r3(l.x - p.x), r3(l.y - p.y), r3(l.z)]) });
+      }
+    }
+    if (total <= 2500 || sp > 0.1) return out;
+  }
+}
+function ragFinish() {
+  const strokes = ragBuildDraw(), b = bodyOf(state.npc);
+  if (strokes.length) b.draw = { hide: ws.ragHide, strokes }; else delete b.draw;
+  state.npc.random = false;
+  wsEnd();
+  toast(strokes.length ? 'Drawing added. Save the design or press Spawn it.' : 'Drawing removed');
+}
+function drawRagDrawPage() {
+  const vr = renderer.xr.isPresenting;
+  wrapText(vr ? 'Hold the trigger and draw on the ghost ragdoll. Each part of a stroke sticks to the body part it touches, and moves with it. Y undoes.'
+    : 'Drag with the left mouse to draw on the ghost ragdoll. Each part of a stroke sticks to the body part it touches. Right-drag to look around, wheel to zoom, Z undoes.', 40, 180, 940);
+  WS_TOOLS.forEach((t, i) => mbtn(32 + i * 138, 250, 132, 58, t.name, () => { ws.tool = i; }, { active: ws.tool === i, size: 20 }));
+  stepper(318, 'Colour', 'Colour', () => ws.color = cyc(ws.color, WS_COLORS.length, -1), () => ws.color = cyc(ws.color, WS_COLORS.length, 1), WS_COLORS[ws.color]);
+  stepper(384, 'Thickness', WS_THICK[ws.thick].name, () => ws.thick = Math.max(0, ws.thick - 1), () => ws.thick = Math.min(2, ws.thick + 1));
+  stepper(450, 'Sticks to', ws.ragAttach ? RAG_PART_NAMES[ws.ragAttach - 1] : 'Nearest part', () => ws.ragAttach = cyc(ws.ragAttach, RAG_PART_KEYS.length + 1, -1), () => ws.ragAttach = cyc(ws.ragAttach, RAG_PART_KEYS.length + 1, 1));
+  const shp = !['free', 'line', 'cyl'].includes(WS_TOOLS[ws.tool].id);
+  wrapText(ws.ragAttach ? 'Everything you draw now sticks to the highlighted part, wherever you draw it.'
+    : shp ? 'The part under your pen lights up. Boxes, balls, cones and rings stick to the part their middle is on, so draw one per limb section.'
+    : 'The part under your pen lights up. Lines and tubes that cross a joint are split so they bend with it.', 612, 336, 370);
+  mbtn(32, 516, 234, 56, ws.ragMirror ? 'Mirror: on' : 'Mirror: off', () => ws.ragMirror = !ws.ragMirror, { active: ws.ragMirror, size: 20 });
+  mbtn(274, 516, 234, 56, ws.ragHide ? 'Body: hidden' : 'Body: shown', () => ws.ragHide = !ws.ragHide, { active: ws.ragHide, size: 20 });
+  mbtn(516, 516, 234, 56, 'Undo', () => wsUndo(), { size: 20 });
+  mbtn(758, 516, 234, 56, 'Clear all', () => wsClear(), { size: 20 });
+  mlabel(40, 600 + 16, `${ws.strokes.length} stroke${ws.strokes.length === 1 ? '' : 's'}`);
+  mbtn(252, 584, 210, 64, 'Cancel', () => wsEnd(), { size: 24 });
+  mbtn(692, 584, 300, 64, 'Done', () => ragFinish(), { active: true, size: 24 });
+}
+function wsStart(rag = false) {
   if (ws.active) return;
   for (const h of hands) { if (h.held) releaseHold(h); h.pushing = false; h.firing = false; }
-  Object.assign(ws, { active: true, step: 'draw', strokes: [], preview: null, kind: null, grip: null, muzzles: [], zone: new Set(), msg: '', tune: tuneDefaults(), name: wsRandomName(), mode: ws.auto ? 2 : ws.mode });
+  Object.assign(ws, { active: true, rag, step: 'draw', strokes: [], preview: null, kind: null, grip: null, muzzles: [], zone: new Set(), msg: '', tune: tuneDefaults(), name: wsRandomName(), mode: ws.auto ? 2 : ws.mode });
   const head = V3(), fwd = V3();
   camera.getWorldPosition(head); camera.getWorldDirection(fwd);
   fwd.y = 0; if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
   const inVR = renderer.xr.isPresenting;
-  ws.center.copy(head).addScaledVector(fwd, inVR ? 0.55 : 1.4); ws.center.y = head.y - (inVR ? 0.12 : 0);
+  if (rag) { ws.center.copy(head).addScaledVector(fwd, inVR ? 0.8 : 1.6); ws.center.y = head.y - (inVR ? 0.35 : 0); }
+  else { ws.center.copy(head).addScaledVector(fwd, inVR ? 0.55 : 1.4); ws.center.y = head.y - (inVR ? 0.12 : 0); }
   ws.group = new THREE.Group(); scene.add(ws.group);
   ws.strokeGroup = new THREE.Group(); ws.markGroup = new THREE.Group(); ws.group.add(ws.strokeGroup, ws.markGroup);
+  if (rag) { ragGhostStart(head); dynGroup.visible = false; } // hide props and NPCs so nothing walks through the drawing
   const frame = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.9, 0.9, 0.9)), new THREE.LineBasicMaterial({ color: 0x3fd0c9, transparent: true, opacity: 0.35 }));
-  frame.position.copy(ws.center); ws.group.add(frame);
+  frame.position.copy(ws.center);
   const grid = new THREE.GridHelper(0.9, 9, 0x3fd0c9, 0x2a3646); grid.position.copy(ws.center); grid.position.y -= 0.45;
-  grid.material.transparent = true; grid.material.opacity = 0.5; ws.group.add(grid);
+  grid.material.transparent = true; grid.material.opacity = 0.5;
+  if (!rag) ws.group.add(frame, grid);
   ws.cursors = new Map();
   for (const h of hands) { const c = new THREE.Mesh(new THREE.SphereGeometry(0.012, 10, 8), new THREE.MeshBasicMaterial({ color: 0xffffff })); c.visible = false; ws.group.add(c); ws.cursors.set(h, c); }
-  if (!inVR) { ws.saveRig.copy(rig.position); ws.saveYaw = desk.yaw; ws.savePitch = desk.pitch; ws.orbitDist = 1.4; desk.pitch = 0; document.exitPointerLock?.(); }
-  menu.page = 'workshop';
+  if (!inVR) { ws.saveRig.copy(rig.position); ws.saveYaw = desk.yaw; ws.savePitch = desk.pitch; ws.orbitDist = rag ? 1.7 : 1.4; desk.pitch = 0; document.exitPointerLock?.(); }
+  menu.page = rag ? 'maker' : 'workshop';
   rig.add(menu.mesh); menu.mesh.material.depthTest = true; menu.mesh.scale.setScalar(inVR ? 0.85 : 0.9);
   menu.visible = true; menu.mesh.visible = true; menu.dirty = true;
   placeWorkshopPanel();
@@ -2670,7 +2823,8 @@ function wsEnd() {
   for (const h of hands) { h.wsStroke = null; h.wsPaint = false; }
   if (ws.group) { disposeMesh(ws.group); ws.group = null; }
   if (!renderer.xr.isPresenting) { rig.position.copy(ws.saveRig); desk.yaw = ws.saveYaw; desk.pitch = ws.savePitch; camera.rotation.set(desk.pitch, desk.yaw, 0); }
-  menu.page = 'workshop';
+  menu.page = ws.rag ? 'maker' : 'workshop';
+  ws.rag = false; ws.ghost = null; dynGroup.visible = true;
   attachMenu(); menu.dirty = true; updateHUD(); updateLockUI();
 }
 function wsTip(hand) {
@@ -2721,11 +2875,17 @@ function wsBarrelDir(m) {
   if (t.lengthSq() < 1e-8) t = m.p.clone().sub(ws.grip || V3()).add(V3(0, 0, -1e-3));
   return t.normalize();
 }
-function wsUndo() {
-  if (!ws.active || ws.step !== 'draw') return;
-  const s = ws.strokes.pop(); if (!s) return;
+function wsRemoveStroke(s) {
+  const i = ws.strokes.indexOf(s); if (i < 0) return;
+  ws.strokes.splice(i, 1);
   if (s.mesh) disposeMesh(s.mesh);
   for (const h of hands) if (h.wsStroke === s) h.wsStroke = null;
+}
+function wsUndo() {
+  if (!ws.active || ws.step !== 'draw') return;
+  const s = ws.strokes[ws.strokes.length - 1]; if (!s) return;
+  wsRemoveStroke(s);
+  if (s.twinOf) wsRemoveStroke(s.twinOf); // mirrored pair: undo both halves
   wsInvalidate();
 }
 function wsClear() { while (ws.strokes.length) wsUndo(); }
@@ -2752,7 +2912,16 @@ function wsDown(hand) {
       hand.wsStroke.tool = tool; hand.wsStroke.a = p.clone();
       hand.wsStroke.basis = { q, x: V3(1, 0, 0).applyQuaternion(q), y: V3(0, 1, 0).applyQuaternion(q), z: V3(0, 0, 1).applyQuaternion(q) };
     }
-    ws.strokes.push(hand.wsStroke); wsInvalidate();
+    ws.strokes.push(hand.wsStroke);
+    if (ws.rag) {
+      const s = hand.wsStroke;
+      s.lock = ws.ragAttach ? RAG_PART_KEYS[ws.ragAttach - 1] : null;
+      if (ws.ragMirror) { // a mirrored copy on the other side, kept in step with this stroke
+        s.twin = { pts: [ragMirrorW(p)], color: s.color, r: s.r, mesh: null, dirty: true, twinOf: s, lock: ragMirrorKey(s.lock) };
+        ws.strokes.push(s.twin);
+      }
+    }
+    wsInvalidate();
   } else if (ws.step === 'grip') {
     const n = wsPick(hand);
     if (n) { ws.grip = n.p.clone(); ws.msg = ''; SFX.click(); hand.pulse(0.4, 30); ws.marksDirty = true; menu.dirty = true; }
@@ -2780,6 +2949,12 @@ function wsShapeUpdate(s, b, final) {
     else s.pts = [s.a];
   }
   s.b = b.clone(); s.dirty = true;
+  ragTwinSync(s);
+}
+function ragTwinSync(s) {
+  const t = s.twin; if (!t || !ws.rag) return;
+  t.sh = s.sh ? ragMirrorSh(s.sh) : null;
+  t.pts = s.pts.map(ragMirrorW); t.r = s.r; t.dirty = true;
 }
 function wsUp(hand) {
   const s = hand.wsStroke;
@@ -2787,7 +2962,7 @@ function wsUp(hand) {
     hand.wsStroke = null;
     const b = s.b || s.a;
     if (s.a.distanceTo(b) < 0.012) { // just a click: drop it
-      ws.strokes.splice(ws.strokes.indexOf(s), 1); if (s.mesh) disposeMesh(s.mesh);
+      wsRemoveStroke(s); if (s.twin) wsRemoveStroke(s.twin);
       ws.msg = 'Drag to size the shape.'; menu.dirty = true; return;
     }
     wsShapeUpdate(s, b, true); SFX.click(); menu.dirty = true;
@@ -2831,12 +3006,14 @@ function wsUpdate(dt) {
     rig.position.set(cam.x, cam.y - 1.6, cam.z); camera.rotation.set(desk.pitch, desk.yaw, 0);
     camera.updateMatrixWorld();
   }
+  ragHover = null;
   for (const h of hands) {
     const cur = ws.cursors.get(h);
     if (!h.active) { if (cur) cur.visible = false; continue; }
     if (cur) {
       const t = ws.step === 'draw' && !h.overMenu ? wsTip(h) : null;
       cur.visible = !!t; if (t) { cur.position.copy(t); cur.material.color.set(WS_COLORS[ws.color]); cur.scale.setScalar(WS_THICK[ws.thick].r / 0.012); }
+      if (ws.rag && t) ragHover = h.wsStroke?.lock || ragPartAt(ragToL(t), ws.ragAttach ? RAG_PART_KEYS[ws.ragAttach - 1] : null);
     }
     if (h.wsStroke?.tool) { const p = wsTip(h); if (p && (!h.wsStroke.b || p.distanceTo(h.wsStroke.b) > 0.002)) wsShapeUpdate(h.wsStroke, p, false); }
     else if (h.wsStroke) {
@@ -2845,7 +3022,7 @@ function wsUpdate(dt) {
       if (p && p.distanceTo(last) > (inVR ? 0.008 : 0.01)) {
         const n = Math.min(40, Math.ceil(p.distanceTo(last) / 0.012)); // fill gaps from fast strokes
         for (let k = 1; k <= n; k++) s.pts.push(last.clone().lerp(p, k / n));
-        s.dirty = true;
+        s.dirty = true; ragTwinSync(s);
         if (s.pts.length >= 400) { wsUp(h); wsDown(h); }
       }
     }
@@ -2862,6 +3039,7 @@ function wsUpdate(dt) {
     if (s.mesh) disposeMesh(s.mesh);
     s.mesh = s.sh ? shapeMesh(s.sh, s.color) : strokeMesh(s.pts, s.r, s.color); ws.strokeGroup.add(s.mesh); s.dirty = false;
   }
+  if (ws.rag) { ragGhostShade(); return; }
   if (ws.marksDirty) { ws.marksDirty = false; wsMarkers(); }
   // swing preview: play the chosen swing on the drawing, around the grip
   ws.strokeGroup.position.set(0, 0, 0); ws.strokeGroup.quaternion.identity();
@@ -4060,7 +4238,8 @@ function drawMenu() {
   g.fillStyle = C.accent; g.fillText('LAB', 32 + w + 6, 62);
   mlabel(MW - 32, 48, `${MAPS[state.map].name} · ${props.length} props · ${npcs.length} NPCs`, { align: 'right', font: '600 20px "IBM Plex Sans", sans-serif' });
   const tabs = [['tools', 'Tools'], ['spawn', 'Spawn'], ['weapons', 'Weapons'], ['workshop', 'Workshop'], ['duel', 'Duel'], ['npc', 'NPC'], ['maps', 'Maps'], ['world', 'World'], ['online', 'Online']];
-  if (ws.active) {
+  if (ws.active && ws.rag) mlabel(40, 117, 'DRAWING YOUR RAGDOLL', { font: '700 26px "Chakra Petch", sans-serif', color: C.accent });
+  else if (ws.active) {
     const si = WS_STEPS.indexOf(ws.step);
     WS_STEP_NAMES.forEach((n, i) => {
       const x = 32 + i * 194; rr(g, x, 88, 184, 56, 10);
@@ -4068,7 +4247,8 @@ function drawMenu() {
       mlabel(x + 92, 117, `${i + 1}  ${n}`, { align: 'center', color: i === si ? '#1a1205' : C.fg, font: '700 22px "Chakra Petch", sans-serif' });
     });
   } else tabs.forEach(([id, name], i) => mbtn(32 + i * 107, 88, 101, 56, name, () => { menu.page = id; }, { active: menu.page === id || (id === 'npc' && menu.page === 'maker'), size: 18 }));
-  const P = ws.active ? 'workshop' : menu.page;
+  const P = ws.active ? (ws.rag ? 'ragdraw' : 'workshop') : menu.page;
+  if (P === 'ragdraw') drawRagDrawPage();
   if (P === 'workshop') drawWorkshopPage();
   if (P === 'duel') drawDuelPage();
   if (P === 'online') drawOnlinePage();
@@ -4137,10 +4317,10 @@ function randomBody() {
   return { ...BODY_DEF, tw: +rand(0.85, 1.2).toFixed(1), td: +rand(0.8, 1.5).toFixed(1), head: +rand(0.9, 1.15).toFixed(1), face: [0, 0, 1, 2, 3, 4][ri(6)],
     hat: Math.random() < 0.35 ? 1 + ri(HATS.length - 1) : 0, hair: ri(HAIRS.length), hairCol: ri(HAIR_COLS.length), hatCol: ri(ACC_COLS.length), shoes: ri(ACC_COLS.length) };
 }
-function bodyIsPlain(b) { return !b || Object.keys(BODY_DEF).every(k => (b[k] ?? BODY_DEF[k]) === BODY_DEF[k]); }
+function bodyIsPlain(b) { return !b || !b.draw?.strokes?.length && Object.keys(BODY_DEF).every(k => (b[k] ?? BODY_DEF[k]) === BODY_DEF[k]); }
 const bodyOf = (n) => (n.body ||= { ...BODY_DEF });
 // Number settings: [key, label, min, max, step]; list settings: [key, label, names]
-const MAKER_TABS = [['shape', 'Shape'], ['head', 'Head'], ['colours', 'Colours'], ['build', 'Build'], ['saved', 'Saved']];
+const MAKER_TABS = [['draw', 'Draw'], ['shape', 'Shape'], ['head', 'Head'], ['colours', 'Colours'], ['build', 'Build'], ['saved', 'Saved']];
 const MAKER_ROWS = {
   shape: [['height', 'Size'], ['tw', 'Shoulders', 0.5, 2.2, 0.1], ['th', 'Torso', 0.6, 1.8, 0.1], ['td', 'Belly', 0.5, 2.5, 0.1], ['arm', 'Arms', 0.5, 2.5, 0.1], ['leg', 'Legs', 0.4, 2.0, 0.1]],
   head: [['head', 'Head size', 0.5, 3.0, 0.1], ['headShape', 'Shape', HEAD_SHAPES], ['neck', 'Neck', 0, 6, 0.5], ['face', 'Face', FACES], ['hat', 'Hat', HATS], ['hair', 'Hair', HAIRS]],
@@ -4195,8 +4375,16 @@ function makerStep(row, n, d) {
 function drawMakerPage() {
   const n = state.npc, tab = menu.makerTab || 'shape';
   bodyOf(n);
-  MAKER_TABS.forEach(([id, name], i) => mbtn(32 + i * 112, 156, 104, 46, name, () => { menu.makerTab = id; }, { active: tab === id, size: 18 }));
-  if (tab === 'saved') {
+  MAKER_TABS.forEach(([id, name], i) => mbtn(32 + i * 93, 156, 87, 46, name, () => { menu.makerTab = id; }, { active: tab === id, size: 17 }));
+  if (tab === 'draw') {
+    const b = bodyOf(n), d = b.draw, cnt = d?.strokes?.length || 0;
+    wrapText('Draw your ragdoll in the air. You get a see-through ragdoll to draw on, and each stroke sticks to the body part you draw it on, so it moves, flops and breaks with that part.', 40, 232, 540);
+    mbtn(32, 378, 554, 84, cnt ? 'Edit drawing' : 'Start drawing', () => wsStart(true), { active: true, size: 28, sub: cnt ? `${cnt} piece${cnt === 1 ? '' : 's'} drawn` : 'Change the body shape first if you want a different skeleton' });
+    if (cnt) {
+      mbtn(32, 472, 272, 58, d.hide ? 'Body: hidden' : 'Body: shown', () => { b.draw = { ...d, hide: !d.hide }; }, { active: d.hide, size: 20, sub: d.hide ? 'Only the drawing shows' : 'Drawing on top of the body' });
+      mbtn(314, 472, 272, 58, 'Erase drawing', () => { delete b.draw; }, { size: 20 });
+    }
+  } else if (tab === 'saved') {
     mlabel(40, 241, 'NAME', { font: '700 18px "Chakra Petch", sans-serif' });
     mbtn(130, 214, 330, 54, n.name || 'Ragdoll', () => {
       if (renderer.xr.isPresenting) { n.name = RAG_NAMES[ri(RAG_NAMES.length)]; return; }
@@ -4239,14 +4427,41 @@ function drawBodyFigure(x0, y0, w, h, n) {
   const top = (P.head.y + hd[1] + (b.hat === 2 ? hd[1] * 1.6 : b.hat === 6 ? hd[1] * 1.3 : b.hat ? hd[1] * 0.5 : 0) + (b.hair === 4 ? hd[1] * 0.6 : 0)) * s;
   const afro = b.hair === 4 ? 1.2 * Math.max(hd[0], hd[2]) : 0;
   const fw = Math.max(P.uArmR.x + Math.max(P.uArmR.he[0], P.lArmR.he[0]), hd[0] * 1.25, afro), sw = Math.max(P.torso.he[2], hd[2] * 1.25, 0.15 * Math.sqrt(b.legT * b.leg), afro);
-  const H = Math.max(1.0, top + 0.12), u = Math.min((h - 62) / H, (w - 70) / ((2 * fw + 2 * sw) * s)), base = y0 + h - 16;
+  let dTop = 0; // drawings can stick up above the head
+  for (const st of b.draw?.strokes || []) { const p = P[st.p]; if (p) for (const a of st.sh ? [st.sh.p] : st.pts) dTop = Math.max(dTop, (p.y + a[1] + (st.r || st.sh?.s[0] || 0)) * s); }
+  const H = Math.max(1.0, top + 0.12, dTop + 0.08), u = Math.min((h - 62) / H, (w - 70) / ((2 * fw + 2 * sw) * s)), base = y0 + h - 16;
   const x1 = x0 + (w - (2 * fw + 2 * sw) * s * u - 30) / 2;
   g.strokeStyle = 'rgba(255,255,255,.07)';
   const stepM = H > 2.4 ? 1 : 0.5;
   for (let m = stepM; m <= H; m += stepM) { const y = base - m * u; g.beginPath(); g.moveTo(x0 + 10, y); g.lineTo(x0 + w - 10, y); g.stroke(); mlabel(x0 + w - 14, y - 10, `${m} m`, { align: 'right', font: '600 14px "IBM Plex Sans", sans-serif' }); }
   g.fillStyle = 'rgba(255,255,255,.12)'; g.fillRect(x0 + 10, base, w - 20, 2);
   const sh = SHIRTS[n.shirt], pa = PANTS[n.pants], sk = SKINS[n.skin], shoe = ACC_COLS[b.shoes], hair = HAIR_COLS[b.hairCol], hat = b.hat === 3 && !b.hatCol ? '#d4af37' : ACC_COLS[b.hatCol];
+  const dr = b.draw?.strokes?.length ? b.draw : null;
+  const sketch = (cx, side) => { // the drawing, flattened onto the front or side view
+    const X = (p, a) => cx + (side ? a[2] : p.x + a[0]) * s * u, Y = (p, a) => base - (p.y + a[1]) * s * u;
+    g.lineCap = g.lineJoin = 'round';
+    for (const st of dr.strokes) {
+      const p = P[st.p]; if (!p) continue;
+      g.strokeStyle = g.fillStyle = st.c;
+      if (st.sh) {
+        const sh = st.sh, x = X(p, sh.p), y = Y(p, sh.p), [a, c] = sh.s.map(v => v * s * u);
+        const ax = V3(0, 1, 0).applyQuaternion(new THREE.Quaternion().fromArray(sh.q));
+        const dx = (side ? ax.z : ax.x) * c / 2, dy = -ax.y * c / 2;
+        g.beginPath();
+        if (sh.t === 'sphere') { g.arc(x, y, Math.max(1, a), 0, 7); g.fill(); }
+        else if (sh.t === 'ring') { g.lineWidth = Math.max(1, c * 2); g.arc(x, y, Math.max(1, a), 0, 7); g.stroke(); }
+        else if (sh.t === 'box') { const w = (side ? sh.s[2] : sh.s[0]) * s * u; g.fillRect(x - w / 2, y - c / 2, w, c); }
+        else { g.lineWidth = Math.max(1, a * 2); g.moveTo(x - dx, y - dy); g.lineTo(x + dx, y + dy); g.stroke(); }
+        continue;
+      }
+      g.lineWidth = Math.max(1, st.r * 2 * s * u);
+      g.beginPath(); st.pts.forEach((a, i) => (i ? g.lineTo(X(p, a), Y(p, a)) : g.moveTo(X(p, a), Y(p, a))));
+      if (st.pts.length === 1) g.lineTo(X(p, st.pts[0]) + 0.1, Y(p, st.pts[0]));
+      g.stroke();
+    }
+  };
   const view = (cx, side) => {
+    if (dr?.hide) return sketch(cx, side);
     const R = (x, y, hw, hh, c) => { g.fillStyle = c; g.fillRect(cx + (x - hw) * s * u, base - (y + hh) * s * u, hw * 2 * s * u, hh * 2 * s * u); };
     const W = (p) => side ? p.he[2] : p.he[0], X = (p) => side ? 0 : p.x;
     const hx = 0, hy = P.head.y, hw = side ? hd[2] : hd[0], hh = hd[1];
@@ -4276,11 +4491,12 @@ function drawBodyFigure(x0, y0, w, h, n) {
     if (b.hat === 5 || b.hat === 7) { g.fillStyle = b.hat === 5 ? '#efe6cf' : hat; for (const sx of side ? [0] : [-1, 1]) { const bx = cx + sx * 0.62 * hw * s * u, by = base - (ht - hh * 0.2) * s * u; g.beginPath(); g.moveTo(bx - 0.03 * s * u, by); g.lineTo(bx + sx * 0.25 * hh * s * u, by - hh * 0.6 * s * u); g.lineTo(bx + 0.03 * s * u, by); g.fill(); } }
     if (b.hat === 6) { g.fillStyle = hat; g.beginPath(); const by = base - (ht - hh * 0.15) * s * u; g.moveTo(cx - hw * 0.5 * s * u, by); g.lineTo(cx, by - hh * 1.3 * s * u); g.lineTo(cx + hw * 0.5 * s * u, by); g.fill(); }
     if (b.hat === 8) { g.strokeStyle = '#ffe27a'; g.lineWidth = 3; g.beginPath(); g.ellipse(cx, base - (ht + 0.13 * b.head) * s * u, hw * 0.72 * s * u, Math.max(2, hw * 0.15 * s * u), 0, 0, 7); g.stroke(); }
+    if (dr) sketch(cx, side);
   };
   view(x1 + fw * s * u, false); view(x1 + 2 * fw * s * u + 30 + sw * s * u, true);
   mlabel(x0 + 14, y0 + 20, (n.name || 'Ragdoll').toUpperCase(), { font: '700 18px "Chakra Petch", sans-serif', color: C.accent2 });
   const mass = Object.values(P).reduce((a, p) => a + p.mass, 0) * s * s;
-  mlabel(x0 + 14, y0 + 42, `${(top).toFixed(2)} m · ${Math.round(mass)} kg`, { font: '600 15px "IBM Plex Sans", sans-serif' });
+  mlabel(x0 + 14, y0 + 42, `${Math.max(top, dTop).toFixed(2)} m · ${Math.round(mass)} kg`, { font: '600 15px "IBM Plex Sans", sans-serif' });
 }
 function drawFigure(cx, top, n) {
   const g = menu.ctx, s = n.height / 3.0, H = 260 * s, u = H / 1.8, base = top + 262;
@@ -4350,7 +4566,7 @@ function updateHUD() {
   bar.hidden = ws.active || renderer.xr.isPresenting;
   [...bar.children].forEach((d, i) => d.classList.toggle('on', i === state.tool));
   const wd = desk.held?.weapon ? desk.held.body.ent.weapon.def : null;
-  $('info').innerHTML = ws.active ? '<span class="k">WEAPON WORKSHOP</span> · left drag: draw · right drag: look around · wheel: zoom · Z: undo stroke<br>Follow the steps on the panel' : (wd ? `<span class="k">${wd.name.toUpperCase()}</span> · click: ${wd.melee ? 'swing' : wd.grenade ? 'pull pin' : 'fire'} · right click: throw · F: drop<br>` :
+  $('info').innerHTML = ws.active ? `<span class="k">${ws.rag ? 'RAGDOLL DRAWING' : 'WEAPON WORKSHOP'}</span> · left drag: draw · right drag: look around · wheel: zoom · Z: undo stroke<br>${ws.rag ? 'Press Done on the panel when you are finished' : 'Follow the steps on the panel'}` : (wd ? `<span class="k">${wd.name.toUpperCase()}</span> · click: ${wd.melee ? 'swing' : wd.grenade ? 'pull pin' : 'fire'} · right click: throw · F: drop<br>` :
     `<span class="k">${TOOLS[state.tool].name.toUpperCase()}</span>${state.tool === 1 ? ' · ' + ITEMS[state.item].name : ''}<br>`) +
     `${MAPS[state.map].name} · ${GRAVITIES[state.gravity].name} g · ${TIMES[state.time].name}${state.paused ? ' · PAUSED' : ''}`;
 }
@@ -4815,5 +5031,5 @@ attachMenu();
 loadMap(0);
 drawMenu();
 updateHUD(); updateLockUI();
-window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody };
+window.__lab = { world, props, npcs, state, loadMap, explode, ITEMS, MAPS, WEAPONS, equipWeapon, desk, toolDown, toolUp, projectiles, stuck, ws, customWeapons, customDef, menu, drawMenu, setMenuVisible, duel, duelStart, net, netConnect, netLeave, rig, hands, wsStart, wsGo, wsFinish, wsFrame, shapeFromDrag, woundNPC, hitEnt, gibs, splats, camera, STARTERS, makerLoad, makerDesign, BODY_DEF, randomBody, ragFinish, ragToW, wsDown, wsUp, wsUpdate, createNPC, npcOptions };
 </script>
