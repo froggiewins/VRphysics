@@ -118,6 +118,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 // Models made in Blender (blender/build_models.py) live in models/ragdoll-lab.glb. Until they load,
 // or if the file is missing, everything uses the simple built-in shapes.
 const MODELS = {};
+let RAG_SKIN = null; // the ragdoll's skinned body: [{ geo, role }], set once the models load
 const modelKey = (s) => THREE.PropertyBinding.sanitizeNodeName(s);
 
 // ====================================================================
@@ -355,13 +356,23 @@ const TEX = {
 // ====================================================================
 //  Static map helpers
 // ====================================================================
-function addStatic(body, mesh) {
+function addStatic(body, mesh, ghost) {
   world.addBody(body); mapBodies.push(body);
   mesh.userData.kind = 'static'; mesh.userData.body = body;
   mesh.position.copy(body.position); mesh.quaternion.copy(body.quaternion);
   mesh.receiveShadow = true; mesh.castShadow = true;
+  if (ghost) mesh.material.visible = false; // collision only: a Blender model shows instead
   staticGroup.add(mesh);
   return body;
+}
+// Places a Blender map model (no physics of its own). Returns null if the models aren't loaded.
+function mapModel(name, x, y, z, o = {}) {
+  const t = MODELS[name]; if (!t) return null;
+  const g = t.clone(true);
+  g.position.set(x, y, z); if (o.rotY) g.rotation.y = o.rotY; if (o.scale) g.scale.setScalar(o.scale);
+  g.traverse(c => { if (c.isMesh) { c.castShadow = o.shadow ?? true; c.receiveShadow = true; } });
+  if (o.pick === false) decoGroup.add(g); else { g.userData.kind = 'static'; staticGroup.add(g); }
+  return g;
 }
 function sMat(color, tex, rx = 1, ry = 1, extra = {}) {
   return new THREE.MeshStandardMaterial({ color, roughness: 0.88, map: tex ? tiled(tex, rx, ry) : null, ...extra });
@@ -373,19 +384,24 @@ function sbox(w, h, d, x, y, z, color, o = {}) {
   else if (o.rot) body.quaternion.setFromEuler(o.rot[0], o.rot[1], o.rot[2]);
   const r = Math.max(w, d) / 2;
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), sMat(color, o.tex, o.tex ? r : 1, o.tex ? Math.max(1, h / 2) : 1));
-  return addStatic(body, mesh);
+  return addStatic(body, mesh, o.ghost);
 }
 function ssphere(r, x, y, z, color, o = {}) {
   const body = new CANNON.Body({ mass: 0, material: o.material || MAT.def, collisionFilterGroup: G_WORLD, position: new CANNON.Vec3(x, y, z) });
   body.addShape(new CANNON.Sphere(r));
   const mesh = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), sMat(color, o.tex, 2, 1, o.flat ? { flatShading: true } : {}));
-  return addStatic(body, mesh);
+  let ghost = o.ghost;
+  if (o.rock && MODELS.M_Rock1) { // one of three Blender rocks, picked by position so a map always looks the same
+    ghost = true;
+    mapModel('M_Rock' + (1 + Math.abs(Math.round(x * 3.7 + z * 7.3)) % 3), x, y, z, { scale: r, rotY: (x * 1.3 + z * 2.1) % 6.28 });
+  }
+  return addStatic(body, mesh, ghost);
 }
 function scyl(r, h, x, y, z, color, o = {}) {
   const body = new CANNON.Body({ mass: 0, material: MAT.def, collisionFilterGroup: G_WORLD, position: new CANNON.Vec3(x, y, z) });
   body.addShape(new CANNON.Cylinder(r, r, h, 12));
   const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 12), sMat(color));
-  return addStatic(body, mesh);
+  return addStatic(body, mesh, o.ghost);
 }
 function ground(size, a, b, o = {}) {
   const tex = gridTex(a, b, o.speckle || 0);
@@ -401,6 +417,11 @@ function deco(mesh, pickable = true) {
   return mesh;
 }
 function tree(x, z, snowy = false, s = 1) {
+  if (MODELS.M_Pine) {
+    scyl(0.22 * s, 2.4 * s, x, 1.2 * s, z, '#6b4a2e', { ghost: true });
+    mapModel(snowy ? 'M_PineSnow' : 'M_Pine', x, 0, z, { scale: s, rotY: (x * 7.1 + z * 3.3) % 6.28 });
+    return;
+  }
   scyl(0.22 * s, 2.4 * s, x, 1.2 * s, z, '#6b4a2e');
   const col = snowy ? '#2f5e4a' : '#2f7a3a';
   for (let i = 0; i < 3; i++) {
@@ -447,18 +468,64 @@ const box1 = (s) => ({ shape: new CANNON.Box(new CANNON.Vec3(s[0] / 2, s[1] / 2,
 function boxProp(pos, size, mass, o = {}) {
   const m = new THREE.MeshStandardMaterial({ color: o.color ?? 0xffffff, map: o.map || null, roughness: o.rough ?? 0.8, metalness: o.metal ?? 0 });
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), m);
-  return makeProp({ shapes: [box1(size)], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'box', sound: o.sound, name: o.name, damping: o.damping });
+  const ent = makeProp({ shapes: [box1(size)], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'box', sound: o.sound, name: o.name, damping: o.damping });
+  const pm = PROP_MODELS[ent.kind];
+  if (pm && pm[1].every((v, i) => Math.abs(v - size[i]) < 1e-3)) { ent.dressKey = pm[0]; dressProp(ent); }
+  return ent;
+}
+// Blender models for props, used when the prop has exactly the size the model was made for
+const PROP_MODELS = {
+  crate: ['P_Crate', [0.5, 0.5, 0.5]], box: ['P_SmallBox', [0.25, 0.25, 0.25]], plank: ['P_Plank', [0.35, 0.08, 2.2]], metal: ['P_SteelBlock', [0.6, 0.6, 0.6]],
+  domino: ['P_Domino', [0.28, 0.5, 0.07]], brick: ['P_Brick', [0.5, 0.25, 0.25]], block: ['P_Block', [0.2, 0.2, 0.6]], cart: ['P_CartBed', [1.0, 0.18, 1.5]],
+};
+// The model's '<Name>_Body' becomes the prop's own mesh (so its colour, texture and the Paint tool still
+// apply); the other pieces are added as trim. Children marked as placeholders are removed.
+const uvCache = new Map();
+function uvGeo(src) { // box-projected UVs, like BoxGeometry's, so the existing textures fit the model
+  if (uvCache.has(src)) return uvCache.get(src);
+  const g = src.clone(); g.computeBoundingBox();
+  const b = g.boundingBox, sz = b.getSize(V3()), p = g.attributes.position, n = g.attributes.normal, uv = new Float32Array(p.count * 2);
+  for (let i = 0; i < p.count; i++) {
+    const ax = Math.abs(n.getX(i)), ay = Math.abs(n.getY(i)), az = Math.abs(n.getZ(i));
+    const X = (p.getX(i) - b.min.x) / sz.x, Y = (p.getY(i) - b.min.y) / sz.y, Z = (p.getZ(i) - b.min.z) / sz.z;
+    if (ax >= ay && ax >= az) { uv[i * 2] = Z; uv[i * 2 + 1] = Y; } else if (ay >= az) { uv[i * 2] = X; uv[i * 2 + 1] = Z; } else { uv[i * 2] = X; uv[i * 2 + 1] = Y; }
+  }
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2)); g.userData.shared = true;
+  uvCache.set(src, g); return g;
+}
+function dressProp(ent) {
+  const name = ent.dressKey, t = name && MODELS[name];
+  if (!t || ent.dressed) return ent;
+  ent.dressed = true;
+  const m = ent.mesh, body = t.children.find(c => c.name.endsWith('_Body'));
+  if (body) { m.geometry.dispose(); m.geometry = m.material.map ? uvGeo(body.geometry) : body.geometry; }
+  if (name === 'P_Crate') { m.material.map = null; m.material.color.set(0xb98a55); m.material.needsUpdate = true; }
+  for (const c of m.children.filter(c => c.userData.placeholder)) disposeMesh(c);
+  for (const c of t.children) {
+    if (c === body) continue;
+    const k = c.clone(true);
+    if (name === 'P_Domino') { k.material = k.material.clone(); k.material.userData = {}; k.material.color.set(m.material.color.getHSL({}).l > 0.5 ? 0x111111 : 0xf4f4f4); }
+    m.add(k);
+  }
+  m.traverse(o => { if (o.isMesh) o.castShadow = o.receiveShadow = true; });
+  return ent;
 }
 function sphereProp(pos, r, mass, o = {}) {
   const m = new THREE.MeshStandardMaterial({ color: o.color ?? 0xffffff, map: o.map || null, roughness: o.rough ?? 0.5, metalness: o.metal ?? 0 });
   const mesh = new THREE.Mesh(new THREE.SphereGeometry(r, 24, 16), m);
-  return makeProp({ shapes: [{ shape: new CANNON.Sphere(r) }], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'ball', sound: o.sound || 'ball', name: o.name, damping: o.damping ?? 0.05, angDamping: o.angDamping ?? 0.1 });
+  const ent = makeProp({ shapes: [{ shape: new CANNON.Sphere(r) }], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'ball', sound: o.sound || 'ball', name: o.name, damping: o.damping ?? 0.05, angDamping: o.angDamping ?? 0.1 });
+  const key = o.name === 'Melon' && Math.abs(r - 0.18) < 1e-3 ? 'P_Melon' : o.name === 'Bowling ball' && Math.abs(r - 0.2) < 1e-3 ? 'P_BowlingBall' : null;
+  if (key) { ent.dressKey = key; dressProp(ent); }
+  return ent;
 }
 function cylProp(pos, r, h, mass, o = {}) {
   const m = new THREE.MeshStandardMaterial({ color: o.color ?? 0xffffff, map: o.map || null, roughness: o.rough ?? 0.6, metalness: o.metal ?? 0 });
   const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 18), m);
   const ent = makeProp({ shapes: [{ shape: new CANNON.Cylinder(r, r, h, 14) }], mesh, mass, pos, quat: o.quat, material: o.material, kind: o.kind || 'cyl', sound: o.sound, name: o.name });
-  return o.kind === 'barrel' && Math.abs(r - 0.3) < 1e-3 && Math.abs(h - 0.9) < 1e-3 ? dressBarrel(ent) : ent;
+  const fits = (rr, hh) => Math.abs(r - rr) < 1e-3 && Math.abs(h - hh) < 1e-3;
+  if (o.kind === 'pin' && fits(0.07, 0.45)) { ent.dressKey = 'P_Pin'; dressProp(ent); }
+  if (o.kind === 'stone' && fits(0.28, 0.22)) { ent.dressKey = 'P_Curling'; dressProp(ent); }
+  return o.kind === 'barrel' && fits(0.3, 0.9) ? dressBarrel(ent) : ent;
 }
 function addJoint(c, a, b) { world.addConstraint(c); joints.push({ c, a, b }); }
 
@@ -479,8 +546,9 @@ function makeCart(pos, yaw) {
     const off = V3(x, -0.1, z).applyQuaternion(q).add(pos);
     const mesh = new THREE.Mesh(wheelGeo.clone(), new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9 }));
     const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.14, 10).rotateZ(Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0xffb020 }));
-    mesh.add(hub);
+    hub.userData.placeholder = true; mesh.add(hub);
     const w = makeProp({ shapes: [{ shape: new CANNON.Cylinder(0.22, 0.22, 0.12, 14), offset: new CANNON.Vec3(), quat: wq }], mesh, mass: 2, pos: off, quat: q, kind: 'wheel', name: 'Wheel', sound: 'ball', angDamping: 0.02 });
+    w.dressKey = 'P_Wheel'; dressProp(w);
     w.body.material = MAT.def;
     const c = new CANNON.HingeConstraint(chassis.body, w.body, { pivotA: new CANNON.Vec3(x, -0.1, z), axisA: new CANNON.Vec3(1, 0, 0), pivotB: new CANNON.Vec3(0, 0, 0), axisB: new CANNON.Vec3(1, 0, 0) });
     addJoint(c, chassis.body, w.body);
@@ -540,24 +608,26 @@ const ITEMS = [
 // ====================================================================
 //  Gore: wound shader, skeleton & organs, gibs, blood
 // ====================================================================
-const GORE_H = 10, GORE_B = 12;
+const GORE_H = 10, GORE_B = 12, GORE_HP = GORE_H, GORE_BP = GORE_B, GORE_SKIN = 24;
 const GORE_MODES = ['Off', 'Bruises only', 'Full'];
 // Skin material that can have chunks cut out (discarded spheres in part-local space),
 // shows bruises, and renders its inside faces as raw meat.
+const goreUniforms = (nh, nb) => ({
+  uHoles: { value: Array.from({ length: nh }, () => new THREE.Vector4(0, 0, 0, 0)) },
+  uBruise: { value: Array.from({ length: nb }, () => new THREE.Vector4(0, 0, 0, 0)) },
+  uBruiseK: { value: new Array(nb).fill(0) },
+  uChar: { value: 0 },
+});
 function goreMaterial(color, o = {}) {
+  const GORE_H = o.nh || GORE_HP, GORE_B = o.nb || GORE_BP; // per-part sizes, or larger for the whole skinned body
   const mat = new THREE.MeshStandardMaterial({ color, roughness: o.rough ?? 0.75, side: THREE.DoubleSide });
-  const u = o.shared ? { ...o.shared } : {
-    uHoles: { value: Array.from({ length: GORE_H }, () => new THREE.Vector4(0, 0, 0, 0)) },
-    uBruise: { value: Array.from({ length: GORE_B }, () => new THREE.Vector4(0, 0, 0, 0)) },
-    uBruiseK: { value: new Array(GORE_B).fill(0) },
-    uChar: { value: 0 },
-  };
+  const u = o.shared ? { ...o.shared } : goreUniforms(GORE_H, GORE_B);
   u.uCloth = { value: o.cloth ? 1 : 0 };
   u.uMeat = { value: new THREE.Color(o.meat ?? 0x7a1410) };
   u.uHoleScale = { value: o.holeScale ?? 1 };
   u.uBruiseOn = { value: o.noBruise ? 0 : 1 };
   mat.userData.gore = u;
-  mat.customProgramCacheKey = () => 'gore1';
+  mat.customProgramCacheKey = () => `gore${GORE_H}x${GORE_B}`;
   mat.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, u);
     sh.vertexShader = sh.vertexShader
@@ -654,12 +724,13 @@ function goreInit(npc, key, body, mesh, P, s) {
   const inner = buildInnards(key, mesh, s, P);
   const half = P.r ? [P.r * s, P.r * s, P.r * s] : P.he.map(v => v * s);
   const minH = Math.min(...half);
-  npc.gore[key] = { holes: [], bruises: [], u, inner, half, sphere: !!P.r, maxR: P.maxR ? P.maxR * s : key === 'head' ? 0.075 * s : key === 'torso' ? 0.13 * s : minH * 1.15 };
+  npc.gore[key] = { npc, holes: [], bruises: [], u, inner, half, sphere: !!P.r, maxR: P.maxR ? P.maxR * s : key === 'head' ? 0.075 * s : key === 'torso' ? 0.13 * s : minH * 1.15 };
 }
 function goreSync(g) {
   for (let i = 0; i < GORE_H; i++) { const h = g.holes[i]; g.u.uHoles.value[i].set(h ? h.x : 0, h ? h.y : 0, h ? h.z : 0, h ? h.r : 0); }
   for (let i = 0; i < GORE_B; i++) { const b = g.bruises[i]; g.u.uBruise.value[i].set(b ? b.x : 0, b ? b.y : 0, b ? b.z : 0, b ? b.r : 0); g.u.uBruiseK.value[i] = b ? b.k : 0; }
   g.inner.visible = g.holes.length > 0;
+  if (g.npc?.skin) skinGoreSync(g.npc);
 }
 function goreHeal(npc) {
   for (const g of Object.values(npc.gore || {})) { g.holes.length = 0; g.bruises.length = 0; g.u.uChar.value = 0; goreSync(g); }
@@ -968,10 +1039,10 @@ function createNPC(pos, yaw, o) {
     if (drawn) for (const st of drawn.strokes) if (st.p === key) mesh.add(ragStrokeMesh(st, s));
     if (hideBody) mat.visible = false; // only the drawing shows; the physics body is still there
     else if (key === 'head') { npc.eyes = npcFace(mesh, lay, s, o.skin); npcHeadwear(mesh, lay, s); }
-    if (!hideBody && (key === 'lLegL' || key === 'lLegR')) {
+    if (!hideBody && !RAG_SKIN && (key === 'lLegL' || key === 'lLegR')) {
       const t = lay.b.legT, f = lay.b.leg;
       const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.13 * s * t, 0.07 * s * Math.sqrt(t), 0.22 * s * Math.sqrt(t * f)), new THREE.MeshStandardMaterial({ color: ACC_COLS[lay.b.shoes] || 0x1b1b1b, roughness: 0.6 }));
-      shoe.position.set(0, (-lay.LL + 0.035 * Math.sqrt(t) - 0.005) * s, 0.04 * s * Math.sqrt(t * f)); shoe.castShadow = true; mesh.add(shoe);
+      shoe.position.set(0, (-lay.LL + 0.035 * Math.sqrt(t) - 0.005) * s, 0.04 * s * Math.sqrt(t * f)); shoe.castShadow = true; shoe.userData.shoe = true; mesh.add(shoe);
     }
     body.ent = npc; body.npcPart = key;
     npc.parts[key] = body; npc.meshes[key] = mesh;
@@ -992,6 +1063,7 @@ function createNPC(pos, yaw, o) {
       });
     });
   }
+  if (RAG_SKIN && !hideBody) ragSkinAttach(npc, lay);
   const P = npc.parts, S = (x, y, z) => new CANNON.Vec3(x * s, y * s, z * s);
   const DOWN = new CANNON.Vec3(0, -1, 0), UP = new CANNON.Vec3(0, 1, 0);
   for (const [a, b, pa, pb, ax, angle, twist] of lay.J) {
@@ -1208,6 +1280,7 @@ function removeEnt(ent) {
     for (const c of ent.constraints) world.removeConstraint(c);
     for (const b of Object.values(ent.parts)) detachBody(b);
     for (const m of Object.values(ent.meshes)) disposeMesh(m);
+    if (ent.skin) disposeMesh(ent.skin.group);
     npcs.splice(npcs.indexOf(ent), 1);
   } else {
     detachBody(ent.body); disposeMesh(ent.mesh);
@@ -1404,9 +1477,9 @@ const MAPS = [
       sbox(2, 2, 3, -12, 1, -12, '#a3a9b0');
       const R = seeded(7);
       for (let i = 0; i < 38; i++) { const a = R() * Math.PI * 2, r = 30 + R() * 70; tree(Math.cos(a) * r, Math.sin(a) * r, false, 0.8 + R() * 0.6); }
-      for (let i = 0; i < 8; i++) { const a = R() * 6.28, r = 16 + R() * 12; ssphere(0.5 + R() * 0.9, Math.cos(a) * r, 0, Math.sin(a) * r, '#8d8f8a', { flat: true }); }
+      for (let i = 0; i < 8; i++) { const a = R() * 6.28, r = 16 + R() * 12; ssphere(0.5 + R() * 0.9, Math.cos(a) * r, 0, Math.sin(a) * r, '#8d8f8a', { flat: true, rock: true }); }
       crateStack(-5, -6, 4);
-      sbox(2.6, 0.8, 1.2, -3, 0.4, 3, '#8a6a45', { tex: TEX.wood });
+      sbox(2.6, 0.8, 1.2, -3, 0.4, 3, '#8a6a45', { tex: TEX.wood, ghost: !!mapModel('M_Table', -3, 0.4, 3) });
       [[0, -4.0], [4, -3.5], [1, -2.9], [6, -2.1]].forEach(([i, x]) => makeWeapon(i, V3(x, i === 4 ? 0.87 : 0.86, 3.05), quatYawTilt(0, 0)));
       ITEMS[2].spawn(V3(2, 0.3, -3)); ITEMS[4].spawn(V3(4, 0.6, -1)); ITEMS[5].spawn(V3(-2, 0.5, -2));
       ITEMS[6].spawn(V3(9, 3, -15), 0);
@@ -1420,14 +1493,14 @@ const MAPS = [
       const wc = '#5e6b78';
       sbox(44, 8, 1, 0, 4, -22.5, wc); sbox(44, 8, 1, 0, 4, 22.5, wc); sbox(1, 8, 44, -22.5, 4, 0, wc); sbox(1, 8, 44, 22.5, 4, 0, wc);
       for (let i = 0; i < 4; i++) {
-        const x = -15 + i * 7, z = -16;
-        for (const [px, pz] of [[-2.4, -0.6], [2.4, -0.6], [-2.4, 0.6], [2.4, 0.6]]) sbox(0.12, 4.2, 0.12, x + px, 2.1, z + pz, '#d9822b');
-        for (const h of [1.1, 2.3, 3.5]) { sbox(5, 0.1, 1.4, x, h, z, '#3c4a5a'); ITEMS[0].spawn(V3(x - 1.2, h + 0.31, z), 0); ITEMS[1].spawn(V3(x + 0.8, h + 0.2, z), 0); }
+        const x = -15 + i * 7, z = -16, ghost = !!mapModel('M_Rack', x, 0, z);
+        for (const [px, pz] of [[-2.4, -0.6], [2.4, -0.6], [-2.4, 0.6], [2.4, 0.6]]) sbox(0.12, 4.2, 0.12, x + px, 2.1, z + pz, '#d9822b', { ghost });
+        for (const h of [1.1, 2.3, 3.5]) { sbox(5, 0.1, 1.4, x, h, z, '#3c4a5a', { ghost }); ITEMS[0].spawn(V3(x - 1.2, h + 0.31, z), 0); ITEMS[1].spawn(V3(x + 0.8, h + 0.2, z), 0); }
       }
       sbox(14, 1.2, 7, 14, 0.6, 15, '#8a8f96');
       sbox(4, 0.3, 4.6, 5.2, 0.55, 15, '#a07c4a', { rot: [0, 0, 0.26], tex: TEX.wood });
       for (let i = 0; i < 6; i++) { const m = new THREE.Mesh(new THREE.PlaneGeometry(0.15, 3), new THREE.MeshBasicMaterial({ color: 0xffc400 })); m.rotation.x = -Math.PI / 2; m.position.set(-10 + i * 4, 0.005, 2); decoGroup.add(m); }
-      for (let i = 0; i < 4; i++) { const l = new THREE.PointLight(0xffe2b0, 18, 26, 1.6); l.position.set(-12 + i * 8, 7, 0); decoGroup.add(l); }
+      for (let i = 0; i < 4; i++) { const l = new THREE.PointLight(0xffe2b0, 18, 26, 1.6); l.position.set(-12 + i * 8, 7, 0); decoGroup.add(l); mapModel('M_Lamp', -12 + i * 8, 7.05, 0, { pick: false, shadow: false }); }
       crateStack(-8, 6, 5); crateStack(6, -4, 3);
       for (let i = 0; i < 7; i++) ITEMS[5].spawn(V3(-16 + (i % 3) * 0.65, 0.46, 12 + Math.floor(i / 3) * 0.65));
       ITEMS[8].spawn(V3(12, 1.6, 15)); ITEMS[8].spawn(V3(13, 1.6, 14));
@@ -1440,17 +1513,17 @@ const MAPS = [
       ground(260, '#8e8e8e', '#858585', { speckle: 120 });
       const R = seeded(3);
       const crater = (cx, cz, rad) => {
-        const n = Math.max(10, Math.round(rad * 3.2));
+        const n = Math.max(10, Math.round(rad * 3.2)), ghost = !!mapModel(`M_Crater${rad}`, cx, 0, cz);
         for (let i = 0; i < n; i++) {
           const a = i / n * Math.PI * 2;
           const yaw = Math.atan2(Math.cos(a), Math.sin(a));
-          sbox(rad * 2 * Math.PI / n * 1.08, 0.5, 3, cx + Math.cos(a) * rad, 0.15, cz + Math.sin(a) * rad, '#7d7d7d', { quat: quatYawTilt(yaw, -0.32) });
+          sbox(rad * 2 * Math.PI / n * 1.08, 0.5, 3, cx + Math.cos(a) * rad, 0.15, cz + Math.sin(a) * rad, '#7d7d7d', { quat: quatYawTilt(yaw, -0.32), ghost });
         }
       };
       crater(-18, -14, 7); crater(20, -24, 10); crater(-30, 18, 6);
-      for (let i = 0; i < 22; i++) { const a = R() * 6.28, r = 14 + R() * 60, br = 0.4 + R() * 1.6; ssphere(br, Math.cos(a) * r, br * 0.2, Math.sin(a) * r, '#9a9a96', { flat: true }); }
-      ssphere(5, 0, -0.8, -12, '#d8dde3');
-      sbox(1.6, 2.2, 0.4, 0, 1.1, -7.3, '#2a3646');
+      for (let i = 0; i < 22; i++) { const a = R() * 6.28, r = 14 + R() * 60, br = 0.4 + R() * 1.6; ssphere(br, Math.cos(a) * r, br * 0.2, Math.sin(a) * r, '#9a9a96', { flat: true, rock: true }); }
+      ssphere(5, 0, -0.8, -12, '#d8dde3', { ghost: !!mapModel('M_Dome', 0, -0.8, -12) });
+      sbox(1.6, 2.2, 0.4, 0, 1.1, -7.3, '#2a3646', { ghost: !!mapModel('M_Airlock', 0, 1.1, -7.3) });
       sbox(8, 0.3, 4, 12, 1.5, 4, '#b8bec6'); sbox(3, 0.3, 6, 12, 0.7, 8.2, '#b8bec6', { rot: [-0.3, 0, 0] });
       const earth = new THREE.Mesh(new THREE.SphereGeometry(22, 32, 24), new THREE.MeshBasicMaterial({ map: canvasTex(256, 128, (g, w, h) => { g.fillStyle = '#2a63c9'; g.fillRect(0, 0, w, h); for (let i = 0; i < 26; i++) { g.fillStyle = i % 3 ? '#3f9a4a' : '#ffffff'; g.beginPath(); g.ellipse(Math.random() * w, Math.random() * h, rand(6, 30), rand(4, 14), Math.random() * 3, 0, 7); g.fill(); } }) }));
       earth.position.set(-140, 90, -220); decoGroup.add(earth);
@@ -1468,12 +1541,16 @@ const MAPS = [
     build() {
       ground(220, '#3e434b', '#383d44', { speckle: 80 });
       sbox(5, 0.4, 12, 0, 1.9, -12, '#e0533c', { rot: [0.34, 0, 0] });
-      const R = 5, N = 9;
+      const R = 5, N = 9, ghost = !!mapModel('M_HalfPipe', -20, 0, -6);
       for (let i = 0; i < N; i++) {
         const th = (i + 0.5) * (Math.PI / 2) / N, arc = R * (Math.PI / 2) / N * 1.12;
-        for (const side of [-1, 1]) sbox(arc, 0.3, 14, -20 + side * (2 + R * Math.sin(th)), R - R * Math.cos(th) + 0.05, -6, '#5b8bd9', { rot: [0, 0, side * th] });
+        for (const side of [-1, 1]) sbox(arc, 0.3, 14, -20 + side * (2 + R * Math.sin(th)), R - R * Math.cos(th) + 0.05, -6, '#5b8bd9', { rot: [0, 0, side * th], ghost });
       }
-      sbox(4, 0.3, 14, -20, 0.1, -6, '#5b8bd9');
+      sbox(4, 0.3, 14, -20, 0.1, -6, '#5b8bd9', { ghost });
+      if (ghost) for (const side of [-1, 1]) { // the model has a deck and solid back walls: give them collision too
+        sbox(0.8, 0.3, 14, -20 + side * 7.25, 4.95, -6, '#5b8bd9', { ghost });
+        sbox(0.3, 5, 14, -20 + side * 7.45, 2.5, -6, '#5b8bd9', { ghost });
+      }
       for (let i = 0; i < 20; i++) { const h = 0.3 * (i + 1); sbox(2, h, 0.5, 18, h / 2, 4 - i * 0.5, '#c9ccd1'); }
       sbox(4, 6, 4, 18, 3, -7.75, '#c9ccd1');
       const pivot = sbox(0.5, 0.6, 0.8, -4, 0.3, 8, '#ffb020');
@@ -1501,7 +1578,7 @@ const MAPS = [
       const house = sbox(4, 0.3, 4, -12, 0.15, -10, '#f4f8ff');
       for (let i = 0; i < 6; i++) {
         const st = cylProp(V3(-3 + i * 1.2, 0.12, -6), 0.28, 0.22, 18, { color: i % 2 ? 0xc0392b : 0xf2c94c, rough: 0.3, kind: 'stone', name: 'Curling stone (18 kg)', sound: 'metal' });
-        const h = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.3), new THREE.MeshStandardMaterial({ color: 0x222222 })); h.position.y = 0.15; st.mesh.add(h);
+        if (!st.dressed) { const h = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.3), new THREE.MeshStandardMaterial({ color: 0x222222 })); h.position.y = 0.15; h.userData.placeholder = true; st.mesh.add(h); }
       }
       const target = new THREE.Mesh(new THREE.RingGeometry(0.6, 2, 32), new THREE.MeshBasicMaterial({ color: 0x2f7fe0, side: THREE.DoubleSide })); target.rotation.x = -Math.PI / 2; target.position.set(0, 0.006, -22); decoGroup.add(target);
       const t2 = new THREE.Mesh(new THREE.CircleGeometry(0.6, 32), new THREE.MeshBasicMaterial({ color: 0xc0392b })); t2.rotation.x = -Math.PI / 2; t2.position.set(0, 0.007, -22); decoGroup.add(t2);
@@ -2218,9 +2295,82 @@ function dressBomb(ent) {
   if (ent.fuse) ent.fuse.position.y = 0.34;
   return ent;
 }
+// ---- Skinned ragdoll body: one mesh from Blender, one bone per physics part ----
+// The template is the default 1.8 m figure. Each bone's bind pose is its part's default centre, and at
+// runtime the bone takes the part's position and rotation, scaled to this ragdoll's body shape. The
+// box part meshes stay as invisible stand-ins: they take hits, carry the face, hats, drawings and organs,
+// and the game recolours them, so the skinned body copies their colours each frame.
+function prepRagSkin(gltf) {
+  const prims = [];
+  gltf.scene.traverse(o => { if (o.isSkinnedMesh) prims.push(o); });
+  if (!prims.length) return;
+  const done = new Set();
+  for (const o of prims) {
+    const remap = o.skeleton.bones.map(b => RAG_PART_KEYS.indexOf(b.name));
+    const si = o.geometry.attributes.skinIndex;
+    if (!done.has(si)) { done.add(si); for (let i = 0; i < si.array.length; i++) si.array[i] = Math.max(0, remap[si.array[i]]); si.needsUpdate = true; }
+  }
+  const roles = { R_Shirt: 'shirt', R_Pants: 'pants', R_Skin: 'skin', R_Shoes: 'shoes' };
+  RAG_SKIN = prims.map(o => ({ geo: o.geometry, role: roles[o.material.name] || 'skin' }));
+}
+function ragSkinAttach(npc, lay) {
+  const s = npc.s, bones = [], inv = [], scales = [];
+  const boxyHead = lay.b.headShape === 1;
+  for (const k of RAG_PART_KEYS) {
+    const d = NPC_PARTS[k], p = lay.P[k], b = new THREE.Bone();
+    b.matrixAutoUpdate = false; bones.push(b);
+    inv.push(new THREE.Matrix4().makeTranslation(-d.x, -d.y, 0));
+    if (k === 'head') scales.push(boxyHead ? V3(1e-3, 1e-3, 1e-3) : p.r ? V3(1, 1, 1).multiplyScalar(p.r * s / d.r) : V3(...p.he.map(v => v * s / d.r)));
+    else scales.push(V3(p.he[0] * s / d.he[0], p.he[1] * s / d.he[1], p.he[2] * s / d.he[2]));
+  }
+  const skel = new THREE.Skeleton(bones, inv), u = goreUniforms(GORE_SKIN, GORE_SKIN), group = new THREE.Group(), mats = {};
+  for (const { geo, role } of RAG_SKIN) {
+    const mat = role === 'shoes' ? new THREE.MeshStandardMaterial({ color: ACC_COLS[lay.b.shoes] || 0x1b1b1b, roughness: 0.6 })
+      : goreMaterial(npc.colors[role], { cloth: role !== 'skin', shared: u, nh: GORE_SKIN, nb: GORE_SKIN });
+    const m = new THREE.SkinnedMesh(geo, mat);
+    m.bind(skel, new THREE.Matrix4()); m.frustumCulled = false; m.castShadow = m.receiveShadow = true;
+    m.raycast = () => {}; // hits go to the part stand-ins
+    group.add(m); mats[role] = mat;
+  }
+  dynGroup.add(group);
+  npc.skin = { group, bones, scales, mats, u };
+  for (const [k, m] of Object.entries(npc.meshes)) {
+    m.children.filter(c => c.userData.shoe).forEach(c => disposeMesh(c));
+    if (k === 'head' && boxyHead) continue; // a box head stays a box
+    m.material.colorWrite = false; m.material.depthWrite = false; m.castShadow = false;
+  }
+  ragSkinUpdate(npc);
+}
+function ragSkinUpdate(n) {
+  const sk = n.skin, M = n.meshes;
+  RAG_PART_KEYS.forEach((k, i) => sk.bones[i].matrixWorld.compose(M[k].position, M[k].quaternion, sk.scales[i]));
+  sk.mats.shirt?.color.copy(M.torso.material.color); sk.mats.pants?.color.copy(M.uLegL.material.color); sk.mats.skin?.color.copy(M.head.material.color);
+  sk.mats.shirt?.emissive.copy(M.torso.material.emissive); sk.mats.pants?.emissive.copy(M.uLegL.material.emissive); sk.mats.skin?.emissive.copy(M.head.material.emissive);
+  let ch = 0; for (const g of Object.values(n.gore)) ch = Math.max(ch, g.u.uChar.value);
+  sk.u.uChar.value = ch;
+}
+// wounds are stored per part; move them into the skinned body's bind pose
+function skinGoreSync(n) {
+  const sk = n.skin, holes = [], bruises = [];
+  RAG_PART_KEYS.forEach((k, i) => {
+    const g = n.gore[k], d = NPC_PARTS[k], c = sk.scales[i];
+    if (!g || c.x < 0.01) return;
+    const B = (h) => [d.x + h.x / c.x, d.y + h.y / c.y, h.z / c.z, h.r * 3 / (c.x + c.y + c.z)];
+    for (const h of g.holes) holes.push(B(h));
+    for (const b of g.bruises) bruises.push([...B(b), b.k]);
+  });
+  const H = holes.slice(-GORE_SKIN), Bz = bruises.slice(-GORE_SKIN);
+  for (let i = 0; i < GORE_SKIN; i++) {
+    const h = H[i], b = Bz[i];
+    sk.u.uHoles.value[i].set(h ? h[0] : 0, h ? h[1] : 0, h ? h[2] : 0, h ? h[3] : 0);
+    sk.u.uBruise.value[i].set(b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0); sk.u.uBruiseK.value[i] = b ? b[4] : 0;
+  }
+}
 function upgradeModels() { // things that were spawned before the models finished loading
+  if (RAG_SKIN) for (const n of npcs) if (!n.skin && !(n.body?.draw?.strokes?.length && n.body.draw.hide)) ragSkinAttach(n, npcLayout(n.body));
   for (const e of props) {
     if (e.removed) continue;
+    if (e.dressKey) dressProp(e);
     if (e.kind === 'barrel') dressBarrel(e);
     else if (e.bomb) dressBomb(e);
     else if (e.weapon && !e.weapon.def.custom && MODELS['W_' + modelKey(e.weapon.def.name)]) {
@@ -2232,13 +2382,15 @@ function upgradeModels() { // things that were spawned before the models finishe
   }
 }
 // next to the page first (GitHub Pages, local server), then the copy in the GitHub repo via jsDelivr
-const MODEL_URLS = [new URL('models/ragdoll-lab.glb', location.href).href, 'https://cdn.jsdelivr.net/gh/froggiewins/VRphysics@d1a9127/models/ragdoll-lab.glb'];
+const MODEL_URLS = [new URL('models/ragdoll-lab.glb', location.href).href, 'https://cdn.jsdelivr.net/gh/froggiewins/VRphysics@9ad42ca/models/ragdoll-lab.glb'];
 (function loadModels(i) {
   if (i >= MODEL_URLS.length) { console.info('Ragdoll Lab: models not found, using built-in shapes'); return; }
   new GLTFLoader().load(MODEL_URLS[i], (gltf) => {
     gltf.scene.traverse(o => { if (o.isMesh) { o.geometry.userData.shared = true; o.material.userData.shared = true; o.castShadow = o.receiveShadow = true; } });
     for (const o of gltf.scene.children) { o.updateMatrixWorld(); MODELS[o.name] = o; }
-    upgradeModels();
+    prepRagSkin(gltf);
+    // still on the title screen: rebuild the map so its trees, rocks and set pieces use the models too
+    if (!started && !net.on) loadMap(state.map); else upgradeModels();
   }, undefined, () => loadModels(i + 1));
 })(0);
 function makeWeapon(i, pos, quat) {
@@ -5024,6 +5176,7 @@ function syncVisuals(dt) {
     const b = n.parts[k]; const pp = paused ? b.position : b.interpolatedPosition, pq = paused ? b.quaternion : b.interpolatedQuaternion;
     m.position.set(pp.x, pp.y, pp.z); m.quaternion.set(pq.x, pq.y, pq.z, pq.w);
   }
+  for (const n of npcs) if (n.skin) ragSkinUpdate(n);
   for (const bl of balloons) {
     const b = bl.body, bp = b.interpolatedPosition, bq = b.interpolatedQuaternion;
     const a = bq.vmult(bl.local).vadd(bp);
